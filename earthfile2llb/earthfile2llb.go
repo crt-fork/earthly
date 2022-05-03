@@ -5,11 +5,10 @@ import (
 	"fmt"
 
 	"github.com/earthly/earthly/util/containerutil"
+	"github.com/earthly/earthly/util/platutil"
 	"github.com/moby/buildkit/client/llb"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"golang.org/x/sync/semaphore"
 
 	"github.com/earthly/earthly/ast/spec"
 	"github.com/earthly/earthly/buildcontext"
@@ -19,6 +18,7 @@ import (
 	"github.com/earthly/earthly/domain"
 	"github.com/earthly/earthly/features"
 	"github.com/earthly/earthly/states"
+	"github.com/earthly/earthly/util/syncutil/semutil"
 	"github.com/earthly/earthly/util/syncutil/serrgroup"
 	"github.com/earthly/earthly/variables"
 )
@@ -42,8 +42,10 @@ type ConvertOpt struct {
 	// Visited is a collection of target states which have been converted to LLB.
 	// This is used for deduplication and infinite cycle detection.
 	Visited *states.VisitedCollection
-	// Platform is the target platform of the build.
-	Platform *specs.Platform
+	// PlatformResolver is a platform resolver, which keeps track of
+	// the current platform, the native platform, the user platform, and
+	// the default platform.
+	PlatformResolver *platutil.Resolver
 	// OverridingVars is a collection of build args used for overriding args in the build.
 	OverridingVars *variables.Scope
 	// A cache for image solves. (maybe dockerTag +) depTargetInputHash -> context containing image.tar.
@@ -92,7 +94,7 @@ type ConvertOpt struct {
 	// ParallelConversion is a feature flag enabling the parallel conversion algorithm.
 	ParallelConversion bool
 	// Parallelism is a semaphore controlling the maximum parallelism.
-	Parallelism *semaphore.Weighted
+	Parallelism semutil.Semaphore
 	// ErrorGroup is a serrgroup used to submit parallel conversion jobs.
 	ErrorGroup *serrgroup.Group
 
@@ -112,7 +114,7 @@ type ConvertOpt struct {
 }
 
 // Earthfile2LLB parses a earthfile and executes the statements for a given target.
-func Earthfile2LLB(ctx context.Context, target domain.Target, opt ConvertOpt, initialCall bool) (mts *states.MultiTarget, err error) {
+func Earthfile2LLB(ctx context.Context, target domain.Target, opt ConvertOpt, initialCall bool) (mts *states.MultiTarget, retErr error) {
 	if opt.SolveCache == nil {
 		opt.SolveCache = states.NewSolveCache()
 	}
@@ -126,9 +128,23 @@ func Earthfile2LLB(ctx context.Context, target domain.Target, opt ConvertOpt, in
 	if opt.ErrorGroup == nil {
 		opt.ErrorGroup, ctx = serrgroup.WithContext(ctx)
 		egWait = true
+		defer func() {
+			if egWait {
+				// We haven't waited for the ErrorGroup yet. The ErrorGroup will
+				// return the very first error encountered, which may be
+				// different than what our error is (our error could be
+				// context.Canceled resulted from the cancellation of the
+				// ErrorGroup, but not the root cause).
+				err2 := opt.ErrorGroup.Err()
+				if err2 != nil {
+					retErr = err2
+					return
+				}
+			}
+		}()
 	}
 	// Resolve build context.
-	bc, err := opt.Resolver.Resolve(ctx, opt.GwClient, target)
+	bc, err := opt.Resolver.Resolve(ctx, opt.GwClient, opt.PlatformResolver, target)
 	if err != nil {
 		return nil, errors.Wrapf(err, "resolve build context for target %s", target.String())
 	}
@@ -145,13 +161,18 @@ func Earthfile2LLB(ctx context.Context, target domain.Target, opt ConvertOpt, in
 			opt.ForceSaveImage = true // legacy mode always saves images regardless of locally or remotely referenced
 		}
 	}
+	opt.PlatformResolver.AllowNativeAndUser = opt.Features.NewPlatform
 
 	targetWithMetadata := bc.Ref.(domain.Target)
-	sts, found, err := opt.Visited.Add(ctx, targetWithMetadata, opt.Platform, opt.AllowPrivileged, opt.OverridingVars, opt.parentDepSub)
+	sts, found, err := opt.Visited.Add(ctx, targetWithMetadata, opt.PlatformResolver, opt.AllowPrivileged, opt.OverridingVars, opt.parentDepSub)
 	if err != nil {
 		return nil, err
 	}
 	if found {
+		if opt.DoSaves {
+			// Set the do saves flag, in case it was not set before.
+			sts.SetDoSaves()
+		}
 		// This target has already been done.
 		return &states.MultiTarget{
 			Final:   sts,
@@ -162,7 +183,7 @@ func Earthfile2LLB(ctx context.Context, target domain.Target, opt ConvertOpt, in
 	if err != nil {
 		return nil, err
 	}
-	interpreter := newInterpreter(converter, targetWithMetadata, opt.AllowPrivileged, opt.ParallelConversion, opt.Parallelism, opt.ErrorGroup, opt.Console, opt.GitLookup)
+	interpreter := newInterpreter(converter, targetWithMetadata, opt.AllowPrivileged, opt.ParallelConversion, opt.Console, opt.GitLookup)
 	err = interpreter.Run(ctx, bc.Earthfile)
 	if err != nil {
 		return nil, err
@@ -172,6 +193,7 @@ func Earthfile2LLB(ctx context.Context, target domain.Target, opt ConvertOpt, in
 		return nil, err
 	}
 	if egWait {
+		egWait = false
 		err := opt.ErrorGroup.Wait()
 		if err != nil {
 			return nil, err
@@ -183,7 +205,8 @@ func Earthfile2LLB(ctx context.Context, target domain.Target, opt ConvertOpt, in
 // GetTargets returns a list of targets from an Earthfile.
 // Note that the passed in domain.Target's target name is ignored (only the reference to the Earthfile is used)
 func GetTargets(ctx context.Context, resolver *buildcontext.Resolver, gwClient gwclient.Client, target domain.Target) ([]string, error) {
-	bc, err := resolver.Resolve(ctx, gwClient, target)
+	platr := platutil.NewResolver(platutil.GetUserPlatform())
+	bc, err := resolver.Resolve(ctx, gwClient, platr, target)
 	if err != nil {
 		return nil, errors.Wrapf(err, "resolve build context for target %s", target.String())
 	}
@@ -196,7 +219,8 @@ func GetTargets(ctx context.Context, resolver *buildcontext.Resolver, gwClient g
 
 // GetTargetArgs returns a list of build arguments for a specified target
 func GetTargetArgs(ctx context.Context, resolver *buildcontext.Resolver, gwClient gwclient.Client, target domain.Target) ([]string, error) {
-	bc, err := resolver.Resolve(ctx, gwClient, target)
+	platr := platutil.NewResolver(platutil.GetUserPlatform())
+	bc, err := resolver.Resolve(ctx, gwClient, platr, target)
 	if err != nil {
 		return nil, errors.Wrapf(err, "resolve build context for target %s", target.String())
 	}

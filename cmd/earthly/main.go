@@ -10,7 +10,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	_ "net/http/pprof" // enable pprof handlers on net/http listener
 	"net/url"
@@ -41,7 +40,6 @@ import (
 	"github.com/moby/buildkit/session/localhost/localhostprovider"
 	"github.com/moby/buildkit/session/sshforward/sshprovider"
 	"github.com/moby/buildkit/util/entitlements"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
@@ -49,7 +47,6 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/semaphore"
 	"golang.org/x/term"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -74,8 +71,10 @@ import (
 	"github.com/earthly/earthly/util/cliutil"
 	"github.com/earthly/earthly/util/containerutil"
 	"github.com/earthly/earthly/util/fileutil"
-	"github.com/earthly/earthly/util/llbutil"
+	"github.com/earthly/earthly/util/llbutil/secretprovider"
+	"github.com/earthly/earthly/util/platutil"
 	"github.com/earthly/earthly/util/reflectutil"
+	"github.com/earthly/earthly/util/syncutil/semutil"
 	"github.com/earthly/earthly/util/termutil"
 	"github.com/earthly/earthly/variables"
 )
@@ -142,6 +141,7 @@ type cliFlags struct {
 	secretFile                string
 	secretStdin               bool
 	apiServer                 string
+	satelliteAddress          string
 	writePermission           bool
 	registrationPublicKey     string
 	dockerfilePath            string
@@ -182,8 +182,6 @@ var (
 var (
 	errLoginFlagsHaveNoEffect            = errors.New("account login flags have no effect when --auth-token (or the EARTHLY_TOKEN environment variable) is set")
 	errLogoutHasNoEffectWhenAuthTokenSet = errors.New("account logout has no effect when --auth-token (or the EARTHLY_TOKEN environment variable) is set")
-	errURLParseFailure                   = errors.New("Invalid URL")
-	errURLValidationFailure              = errors.New("URL did not pass validation")
 )
 
 func profhandler() {
@@ -284,7 +282,7 @@ func main() {
 		padding = conslogging.NoPadding
 	}
 
-	app := newEarthlyApp(ctx, conslogging.Current(colorMode, padding, false))
+	app := newEarthlyApp(ctx, conslogging.Current(colorMode, padding, conslogging.Info))
 	app.unhideFlags(ctx)
 	app.autoComplete(ctx)
 
@@ -309,12 +307,7 @@ func main() {
 }
 
 func getVersionPlatform() string {
-	var isRelease = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
-	v := Version
-	if !isRelease.MatchString(Version) {
-		v = fmt.Sprintf("%s-%s", Version, GitSha)
-	}
-	return fmt.Sprintf("%s %s %s", v, GitSha, getPlatform())
+	return fmt.Sprintf("%s %s %s", Version, GitSha, getPlatform())
 }
 
 func getPlatform() string {
@@ -510,13 +503,6 @@ func newEarthlyApp(ctx context.Context, console conslogging.ConsoleLogger) *eart
 			Destination: &app.keyPath,
 			Hidden:      true,
 		},
-		&cli.IntFlag{
-			Name:        "buildkit-cache-size-mb",
-			Value:       10000,
-			EnvVars:     []string{"EARTHLY_BUILDKIT_CACHE_SIZE_MB"},
-			Usage:       "The total size of the buildkit cache, in MB",
-			Destination: &app.buildkitdSettings.CacheSizeMb,
-		},
 		&cli.StringFlag{
 			Name:        "buildkit-image",
 			Value:       DefaultBuildkitdImage,
@@ -592,6 +578,14 @@ func newEarthlyApp(ctx context.Context, console conslogging.ConsoleLogger) *eart
 			EnvVars:     []string{"EARTHLY_SERVER"},
 			Usage:       "API server override for dev purposes",
 			Destination: &app.apiServer,
+			Hidden:      true, // Internal.
+		},
+		&cli.StringFlag{
+			Name:        "satellite",
+			Value:       containerutil.SatelliteAddress,
+			EnvVars:     []string{"EARTHLY_SATELLITE"},
+			Usage:       "Satellite address override for dev purposes",
+			Destination: &app.satelliteAddress,
 			Hidden:      true, // Internal.
 		},
 		&cli.BoolFlag{
@@ -1064,7 +1058,7 @@ func (app *earthlyApp) before(context *cli.Context) error {
 	}
 
 	if app.verbose {
-		app.console = app.console.WithVerbose(true)
+		app.console = app.console.WithLogLevel(conslogging.Verbose)
 	}
 
 	if context.IsSet("config") {
@@ -1150,6 +1144,8 @@ func (app *earthlyApp) before(context *cli.Context) error {
 	app.buildkitdSettings.UseTCP = bkURL.Scheme == "tcp"
 	app.buildkitdSettings.UseTLS = app.cfg.Global.TLSEnabled
 	app.buildkitdSettings.MaxParallelism = app.cfg.Global.BuildkitMaxParallelism
+	app.buildkitdSettings.CacheSizeMb = app.cfg.Global.BuildkitCacheSizeMb
+	app.buildkitdSettings.CacheSizePct = app.cfg.Global.BuildkitCacheSizePct
 
 	// ensure the MTU is something allowable in IPv4, cap enforced by type. Zero is autodetect.
 	if app.cfg.Global.CniMtu != 0 && app.cfg.Global.CniMtu < 68 {
@@ -1181,6 +1177,45 @@ func (app *earthlyApp) before(context *cli.Context) error {
 	}
 
 	return nil
+}
+
+func (app *earthlyApp) configureSatellite(cc cloud.Client) error {
+	if !app.isUsingSatellite() || cc == nil {
+		// If the app is not using a cloud client, or the command doesn't interact with the cloud (prune, bootstrap)
+		// then pretend its all good and use your regular configuration.
+		return nil
+	}
+
+	// When using a satellite, interactive and local do not work; as they are not SSL nor routable yet.
+	app.console.Warnf("Note: the Interactive Debugger, Interactive RUN commands, and Local Registries do not yet work on Earthly Satellites.")
+
+	// Set up extra settings needed for buildkit RPC metadata
+	app.buildkitdSettings.BuildkitAddress = app.satelliteAddress
+	app.buildkitdSettings.SatelliteName = app.cfg.Satellite.Name
+	app.buildkitdSettings.SatelliteOrg = app.cfg.Satellite.Org
+
+	token, err := cc.GetAuthToken()
+	if err != nil {
+		return errors.Wrap(err, "failed to get auth token")
+	}
+	app.buildkitdSettings.SatelliteToken = token
+
+	// TODO (dchw) what other settings might we want to override here?
+
+	return nil
+}
+
+func (app *earthlyApp) isUsingSatellite() bool {
+	return len(app.cfg.Satellite.Name) > 0
+}
+
+func (app *earthlyApp) GetBuildkitClient(c *cli.Context, cc cloud.Client) (*client.Client, error) {
+	err := app.configureSatellite(cc)
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not construct new buildkit client")
+	}
+
+	return buildkitd.NewClient(c.Context, app.console, app.buildkitdImage, app.containerName, app.containerFrontend, app.buildkitdSettings)
 }
 
 func (app *earthlyApp) handleTLSCertificateSettings(context *cli.Context) {
@@ -1260,12 +1295,6 @@ func (app *earthlyApp) processDeprecatedCommandOptions(context *cli.Context, cfg
 		}
 	}
 
-	if context.IsSet("buildkit-cache-size-mb") {
-		app.console.Warnf("Warning: the --buildkit-cache-size-mb command flag is deprecated and is now configured in the ~/.earthly/config.yml file under the buildkit_cache_size setting; see https://docs.earthly.dev/earthly-config for reference.\n")
-	} else {
-		app.buildkitdSettings.CacheSizeMb = cfg.Global.BuildkitCacheSizeMb
-	}
-
 	if cfg.Global.DebuggerPort != config.DefaultDebuggerPort {
 		app.console.Warnf("Warning: specifying the port using the debugger-port setting is deprecated. Set it in ~/.earthly/config.yml as part of the debugger_host variable; see https://docs.earthly.dev/earthly-config for reference.\n")
 	}
@@ -1317,6 +1346,8 @@ func (app *earthlyApp) autoComplete(ctx context.Context) {
 	if !found {
 		return
 	}
+
+	app.console = app.console.WithLogLevel(conslogging.Silent)
 
 	err := app.autoCompleteImp(ctx)
 	if err != nil {
@@ -1555,6 +1586,14 @@ func (app *earthlyApp) run(ctx context.Context, args []string) int {
 				"Check your git auth settings.\n" +
 					"Did you ssh-add today? Need to configure ~/.earthly/config.yml?\n" +
 					"For more information see https://docs.earthly.dev/guides/auth\n")
+		} else if strings.Contains(err.Error(), "failed to compute cache key") && strings.Contains(err.Error(), ": not found") {
+			re := regexp.MustCompile(`("[^"]*"): not found`)
+			var matches = re.FindStringSubmatch(err.Error())
+			if len(matches) == 2 {
+				app.console.Warnf("Error: File not found %v\n", matches[1])
+			} else {
+				app.console.Warnf("Error: File not found: %v\n", err.Error())
+			}
 		} else if strings.Contains(failedOutput, "Invalid ELF image for this architecture") {
 			app.console.Warnf("Error: %v\n", err)
 			app.console.Printf(
@@ -1744,7 +1783,7 @@ func (app *earthlyApp) bootstrap(c *cli.Context) error {
 		err = nil
 	}
 
-	if !app.bootstrapNoBuildkit {
+	if !app.bootstrapNoBuildkit && !app.isUsingSatellite() {
 		bkURL, err := url.Parse(app.buildkitHost)
 		if err != nil {
 			return errors.Wrapf(err, "invalid buildkit_host: %s", app.cfg.Global.BuildkitHost)
@@ -1763,7 +1802,7 @@ func (app *earthlyApp) bootstrap(c *cli.Context) error {
 		}
 
 		// Bootstrap buildkit - pulls image and starts daemon.
-		bkClient, err := buildkitd.NewClient(c.Context, app.console, app.buildkitdImage, app.containerName, app.containerFrontend, app.buildkitdSettings)
+		bkClient, err := app.GetBuildkitClient(c, nil)
 		if err != nil {
 			return errors.Wrap(err, "bootstrap new buildkitd client")
 		}
@@ -2052,16 +2091,18 @@ func (app *earthlyApp) actionRegister(c *cli.Context) error {
 
 	pword := app.password
 	if app.password == "" {
-		fmt.Println("pick a password")
+		fmt.Printf("pick a password: ")
 		enteredPassword, err := term.ReadPassword(int(syscall.Stdin))
 		if err != nil {
 			return err
 		}
-		fmt.Println("confirm password")
+		fmt.Println("")
+		fmt.Printf("confirm password: ")
 		enteredPassword2, err := term.ReadPassword(int(syscall.Stdin))
 		if err != nil {
 			return err
 		}
+		fmt.Println("")
 		if string(enteredPassword) != string(enteredPassword2) {
 			return errors.Errorf("passwords do not match")
 		}
@@ -2516,8 +2557,12 @@ func (app *earthlyApp) actionPrune(c *cli.Context) error {
 		return nil
 	}
 
+	if app.isUsingSatellite() {
+		return errors.New("Cannot prune when using a satellite")
+	}
+
 	// Prune via API.
-	bkClient, err := buildkitd.NewClient(c.Context, app.console, app.buildkitdImage, app.containerName, app.containerFrontend, app.buildkitdSettings)
+	bkClient, err := app.GetBuildkitClient(c, nil)
 	if err != nil {
 		return errors.Wrap(err, "prune new buildkitd client")
 	}
@@ -2776,10 +2821,7 @@ func (app *earthlyApp) actionBuildImp(c *cli.Context, flagArgs, nonFlagArgs []st
 
 	// Default upload logs, unless explicitly configured
 	if !app.cfg.Global.DisableLogSharing {
-		_, _, _, whoAmIErr := cc.WhoAmI()
-		isLoggedIn := whoAmIErr == nil
-
-		if isLoggedIn {
+		if cc.IsLoggedIn() {
 			// If you are logged in, then add the bundle builder code, and configure cleanup and post-build messages.
 			app.console = app.console.WithLogBundleWriter(target.String(), cleanCollection)
 
@@ -2797,16 +2839,11 @@ func (app *earthlyApp) actionBuildImp(c *cli.Context, flagArgs, nonFlagArgs []st
 					app.console.Warnf(err.Error())
 					return
 				}
-				app.console.Printf("Share your build log with this link: %s\n", id)
+				app.console.Printf("Shareable link: %s\n", id)
 			}()
 		} else {
-			// If you are not logged in, then advertise the service, since they probably turned it on to try it.
 			defer func() { // Defer this to keep log upload code together
-				if errors.Is(whoAmIErr, cloud.ErrUnauthorized) {
-					app.console.Printf("Share your logs with an Earthly account (experimental)! Register for one at https://ci.earthly.dev.")
-				} else {
-					app.console.Warnf("Logs were not shared, due to earthly login error: %s", whoAmIErr.Error())
-				}
+				app.console.Printf("Share your logs with an Earthly account (experimental)! Register for one at https://ci.earthly.dev.")
 			}()
 		}
 	}
@@ -2814,7 +2851,7 @@ func (app *earthlyApp) actionBuildImp(c *cli.Context, flagArgs, nonFlagArgs []st
 	app.console.PrintPhaseHeader(builder.PhaseInit, false, "")
 	app.warnIfArgContainsBuildArg(flagArgs)
 
-	bkClient, err := buildkitd.NewClient(c.Context, app.console, app.buildkitdImage, app.containerName, app.containerFrontend, app.buildkitdSettings)
+	bkClient, err := app.GetBuildkitClient(c, cc)
 	if err != nil {
 		return errors.Wrap(err, "build new buildkitd client")
 	}
@@ -2826,16 +2863,26 @@ func (app *earthlyApp) actionBuildImp(c *cli.Context, flagArgs, nonFlagArgs []st
 		return errors.Wrap(err, "get buildkit container IP")
 	}
 
-	platformsSlice := make([]*specs.Platform, 0, len(app.platformsStr.Value()))
+	nativePlatform, err := platutil.GetNativePlatformViaBkClient(c.Context, bkClient)
+	if err != nil {
+		return errors.Wrap(err, "get native platform via buildkit client")
+	}
+	platr := platutil.NewResolver(nativePlatform)
+	platr.AllowNativeAndUser = true
+	platformsSlice := make([]platutil.Platform, 0, len(app.platformsStr.Value()))
 	for _, p := range app.platformsStr.Value() {
-		platform, err := llbutil.ParsePlatform(p)
+		platform, err := platr.Parse(p)
 		if err != nil {
 			return errors.Wrapf(err, "parse platform %s", p)
 		}
 		platformsSlice = append(platformsSlice, platform)
 	}
-	if len(platformsSlice) == 0 {
-		platformsSlice = []*specs.Platform{nil}
+	switch len(platformsSlice) {
+	case 0:
+	case 1:
+		platr.UpdatePlatform(platformsSlice[0])
+	default:
+		return errors.Errorf("multi-platform builds are not yet supported on the command line. You may, however, create a target with the instruction BUILD --plaform ... --platform ... %s", target)
 	}
 
 	dotEnvMap, err := godotenv.Read(app.envFile)
@@ -2882,7 +2929,11 @@ func (app *earthlyApp) actionBuildImp(c *cli.Context, flagArgs, nonFlagArgs []st
 	buildContextProvider := provider.NewBuildContextProvider(app.console)
 	buildContextProvider.AddDirs(defaultLocalDirs)
 	attachables := []session.Attachable{
-		llbutil.NewSecretProvider(cc, secretsMap),
+		secretprovider.New(
+			secretprovider.NewSecretProviderCmd(app.cfg.Global.SecretProvider),
+			secretprovider.NewMapStore(secretsMap),
+			secretprovider.NewCloudStore(cc),
+		),
 		buildContextProvider,
 		localhostProvider,
 	}
@@ -2961,9 +3012,9 @@ func (app *earthlyApp) actionBuildImp(c *cli.Context, flagArgs, nonFlagArgs []st
 			cacheExport = app.remoteCache
 		}
 	}
-	var parallelism *semaphore.Weighted
+	var parallelism semutil.Semaphore
 	if app.cfg.Global.ConversionParallelism != 0 {
-		parallelism = semaphore.NewWeighted(int64(app.cfg.Global.ConversionParallelism))
+		parallelism = semutil.NewWeighted(int64(app.cfg.Global.ConversionParallelism))
 	}
 	localRegistryAddr := ""
 	if isLocal && app.localRegistryHost != "" {
@@ -3007,9 +3058,6 @@ func (app *earthlyApp) actionBuildImp(c *cli.Context, flagArgs, nonFlagArgs []st
 
 	app.console.PrintPhaseFooter(builder.PhaseInit, false, "")
 
-	if len(platformsSlice) != 1 {
-		return errors.Errorf("multi-platform builds are not yet supported on the command line. You may, however, create a target with the instruction BUILD --plaform ... --platform ... %s", target)
-	}
 	builtinArgs := variables.DefaultArgs{
 		EarthlyVersion:  Version,
 		EarthlyBuildSha: GitSha,
@@ -3019,7 +3067,7 @@ func (app *earthlyApp) actionBuildImp(c *cli.Context, flagArgs, nonFlagArgs []st
 		Push:                       app.push,
 		NoOutput:                   app.noOutput,
 		OnlyFinalTargetImages:      app.imageMode,
-		Platform:                   platformsSlice[0],
+		PlatformResolver:           platr,
 		EnableGatewayClientLogging: app.debug,
 		BuiltinArgs:                builtinArgs,
 
@@ -3037,25 +3085,6 @@ func (app *earthlyApp) actionBuildImp(c *cli.Context, flagArgs, nonFlagArgs []st
 	}
 
 	return nil
-}
-
-func (app *earthlyApp) hasSSHKeys() bool {
-	if app.sshAuthSock == "" {
-		return false
-	}
-
-	agentSock, err := net.Dial("unix", app.sshAuthSock)
-	if err != nil {
-		return false
-	}
-
-	sshAgent := agent.NewClient(agentSock)
-	keys, err := sshAgent.List()
-	if err != nil {
-		return false
-	}
-
-	return len(keys) > 0
 }
 
 func (app *earthlyApp) updateGitLookupConfig(gitLookup *buildcontext.GitLookup) error {
@@ -3146,10 +3175,8 @@ func (app *earthlyApp) actionListTargets(c *cli.Context) error {
 			fmt.Printf("+%s\n", t)
 		}
 		if app.lsShowArgs {
-			if args != nil {
-				for _, arg := range args {
-					fmt.Printf("  --%s\n", arg)
-				}
+			for _, arg := range args {
+				fmt.Printf("  --%s\n", arg)
 			}
 		}
 	}

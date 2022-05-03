@@ -12,6 +12,7 @@ import (
 // Settings represents the buildkitd settings used to start up the daemon with.
 type Settings struct {
 	CacheSizeMb          int
+	CacheSizePct         int
 	Debug                bool
 	BuildkitAddress      string
 	DebuggerAddress      string
@@ -30,6 +31,9 @@ type Settings struct {
 	VolumeName           string
 	IPTables             string
 	MaxParallelism       int
+	SatelliteName        string `hash:"ignore"`
+	SatelliteOrg         string `hash:"ignore"`
+	SatelliteToken       string `hash:"ignore"`
 }
 
 // Hash returns a secure hash of the settings.

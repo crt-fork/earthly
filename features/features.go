@@ -29,6 +29,13 @@ type Features struct {
 	UseCacheCommand            bool `long:"use-cache-command" description:"allow use of CACHE command in Earthfiles"`
 	UseHostCommand             bool `long:"use-host-command" description:"allow use of HOST command in Earthfiles"`
 	ExecAfterParallel          bool `long:"exec-after-parallel" description:"force execution after parallel conversion"`
+	UseCopyLink                bool `long:"use-copy-link" description:"use the equivalent of COPY --link for all copy-like operations"`
+	ParallelLoad               bool `long:"parallel-load" description:"perform parallel loading of images into WITH DOCKER"`
+	NoTarBuildOutput           bool `long:"no-tar-build-output" description:"do not print output when creating a tarball to load into WITH DOCKER"`
+	ShellOutAnywhere           bool `long:"shell-out-anywhere" description:"allow shelling-out in the middle of ARGs, or any other command"`
+	NewPlatform                bool `long:"new-platform" description:"enable new platform behavior"`
+	UseNoManifestList          bool `long:"use-no-manifest-list" description:"enable the SAVE IMAGE --no-manifest-list option"`
+	UseChmod                   bool `long:"use-chmod" description:"enable the SAVE IMAGE --no-manifest-list option"`
 
 	Major int
 	Minor int
@@ -125,63 +132,75 @@ func ApplyFlagOverrides(ftrs *Features, envOverrides string) error {
 
 var errUnexpectedArgs = fmt.Errorf("unexpected VERSION arguments; should be VERSION [flags] <major-version>.<minor-version>")
 
-func instrumentVersion(_ string, opt *goflags.Option, s *string) *string {
+func instrumentVersion(_ string, opt *goflags.Option, s *string) (*string, error) {
 	analytics.Count("version-feature-flags", opt.LongName)
-	return s // don't modify the flag, just pass it back.
+	return s, nil // don't modify the flag, just pass it back.
 }
 
 // GetFeatures returns a features struct for a particular version
-func GetFeatures(version *spec.Version) (*Features, error) {
+func GetFeatures(version *spec.Version) (*Features, bool, error) {
 	var ftrs Features
-
-	if version == nil {
-		return &ftrs, nil
+	hasVersion := (version != nil)
+	if !hasVersion {
+		// If no version is specified, we default to 0.5 (the Earthly version
+		// before the VERSION command was introduced).
+		version = &spec.Version{
+			Args: []string{"0.5"},
+		}
 	}
 
 	if version.Args == nil {
-		return nil, errUnexpectedArgs
+		return nil, false, errUnexpectedArgs
 	}
 
 	parsedArgs, err := flagutil.ParseArgsWithValueModifier("VERSION", &ftrs, version.Args, instrumentVersion)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if len(parsedArgs) != 1 {
-		return nil, errUnexpectedArgs
+		return nil, false, errUnexpectedArgs
 	}
 
 	majorAndMinor := strings.Split(parsedArgs[0], ".")
 	if len(majorAndMinor) != 2 {
-		return nil, errUnexpectedArgs
+		return nil, false, errUnexpectedArgs
 	}
 	ftrs.Major, err = strconv.Atoi(majorAndMinor[0])
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to parse major version %q", majorAndMinor[0])
+		return nil, false, errors.Wrapf(err, "failed to parse major version %q", majorAndMinor[0])
 	}
 	ftrs.Minor, err = strconv.Atoi(majorAndMinor[1])
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to parse minor version %q", majorAndMinor[1])
+		return nil, false, errors.Wrapf(err, "failed to parse minor version %q", majorAndMinor[1])
 	}
 
 	// Enable version-specific features.
-	switch {
-	case versionAtLeast(ftrs, 0, 6):
+	if versionAtLeast(ftrs, 0, 5) {
+		ftrs.ExecAfterParallel = true
+		ftrs.ParallelLoad = true
+	}
+	if versionAtLeast(ftrs, 0, 6) {
 		ftrs.ReferencedSaveOnly = true
 		ftrs.UseCopyIncludePatterns = true
 		ftrs.ForIn = true
 		ftrs.RequireForceForUnsafeSaves = true
 		ftrs.NoImplicitIgnore = true
-		ftrs.ExecAfterParallel = true
-	case versionAtLeast(ftrs, 0, 7):
+	}
+	if versionAtLeast(ftrs, 0, 7) {
 		ftrs.ExplicitGlobal = true
 		ftrs.CheckDuplicateImages = true
 		ftrs.EarthlyVersionArg = true
 		ftrs.UseCacheCommand = true
 		ftrs.UseHostCommand = true
+		ftrs.UseCopyLink = true
+		ftrs.NewPlatform = true
+		ftrs.NoTarBuildOutput = true
+		ftrs.UseNoManifestList = true
+		ftrs.UseChmod = true
 	}
 
-	return &ftrs, nil
+	return &ftrs, hasVersion, nil
 }
 
 // versionAtLeast returns true if the version configured in `ftrs`

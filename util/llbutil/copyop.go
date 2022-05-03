@@ -3,19 +3,20 @@ package llbutil
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"path"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/earthly/earthly/util/llbutil/pllb"
+	"github.com/earthly/earthly/util/platutil"
 	"github.com/moby/buildkit/client/llb"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
 
 // CopyOp is a simplified llb copy operation.
-func CopyOp(srcState pllb.State, srcs []string, destState pllb.State, dest string, allowWildcard bool, isDir bool, keepTs bool, chown string, ifExists, symlinkNoFollow bool, opts ...llb.ConstraintsOpt) pllb.State {
+func CopyOp(srcState pllb.State, srcs []string, destState pllb.State, dest string, allowWildcard bool, isDir bool, keepTs bool, chown string, chmod *fs.FileMode, ifExists, symlinkNoFollow, merge bool, opts ...llb.ConstraintsOpt) pllb.State {
 	destAdjusted := dest
 	if dest == "." || dest == "" || len(srcs) > 1 {
 		destAdjusted += string("/") // TODO: needs to be the containers platform, not the earthly hosts platform. For now, this is always Linux.
@@ -42,6 +43,7 @@ func CopyOp(srcState pllb.State, srcs []string, destState pllb.State, dest strin
 		}
 		copyOpts := append([]llb.CopyOption{
 			&llb.CopyInfo{
+				Mode:                chmod,
 				FollowSymlinks:      !symlinkNoFollow,
 				CopyDirContentsOnly: !isDir,
 				AttemptUnpack:       false,
@@ -59,21 +61,21 @@ func CopyOp(srcState pllb.State, srcs []string, destState pllb.State, dest strin
 	if fa == nil {
 		return destState
 	}
+	if merge && chown == "" {
+		return pllb.Merge([]pllb.State{destState, pllb.Scratch().File(fa)}, opts...)
+	}
 	return destState.File(fa, opts...)
 }
 
 // CopyWithRunOptions copies from `src` to `dest` and returns the result in a separate LLB State.
 // This operation is similar llb.Copy, however, it can apply llb.RunOptions (such as a mount)
 // Interanally, the operation runs on the internal COPY image used by Dockerfile.
-func CopyWithRunOptions(srcState pllb.State, src, dest string, platform *specs.Platform, opts ...llb.RunOption) pllb.State {
+func CopyWithRunOptions(srcState pllb.State, src, dest string, platr *platutil.Resolver, opts ...llb.RunOption) pllb.State {
 	// Docker's internal image for running COPY.
 	// Ref: https://github.com/moby/buildkit/blob/v0.9.3/frontend/dockerfile/dockerfile2llb/convert.go#L40
 	const copyImg = "docker/dockerfile-copy:v0.1.9@sha256:e8f159d3f00786604b93c675ee2783f8dc194bb565e61ca5788f6a6e9d304061"
-	imgOpts := []llb.ImageOption{llb.MarkImageInternal}
-
-	if platform != nil {
-		imgOpts = append(imgOpts, llb.Platform(*platform))
-	}
+	// Use the native platform instead of the target platform.
+	imgOpts := []llb.ImageOption{llb.MarkImageInternal, llb.Platform(platr.LLBNative())}
 
 	// The following executes the `copy` command, which is a custom exectuable
 	// contained in the Dockerfile COPY image above. The following .Run()
@@ -85,11 +87,7 @@ func CopyWithRunOptions(srcState pllb.State, src, dest string, platform *specs.P
 	copyState := pllb.Image(copyImg, imgOpts...)
 	run := copyState.Run(opts...)
 	destState := run.AddMount("/dest", srcState)
-
-	if platform != nil {
-		destState = destState.Platform(*platform)
-	}
-
+	destState = destState.Platform(platr.ToLLBPlatform(platr.Current()))
 	return destState
 }
 

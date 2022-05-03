@@ -3,13 +3,15 @@ VERSION 0.6
 ARG DOCKERHUB_USER_SECRET=+secrets/DOCKERHUB_USER
 ARG DOCKERHUB_TOKEN_SECRET=+secrets/DOCKERHUB_TOKEN
 ARG DOCKERHUB_MIRROR
+ARG DOCKERHUB_MIRROR_INSECURE=false
 ARG DOCKERHUB_AUTH=true
 
 FROM ../..+base \
     --DOCKERHUB_AUTH=$DOCKERHUB_AUTH \
     --DOCKERHUB_USER_SECRET=$DOCKERHUB_USER_SECRET \
     --DOCKERHUB_TOKEN_SECRET=$DOCKERHUB_TOKEN_SECRET \
-    --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR
+    --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR \
+    --DOCKERHUB_MIRROR_INSECURE=$DOCKERHUB_MIRROR_INSECURE
 
 # server creates a ssh-based git server; this repo can then be cloned by running
 # "git clone git@selfsigned.example.com:testuser/repo.git"
@@ -42,10 +44,10 @@ server:
         passwd git -u
     COPY no-interactive-login /home/git/git-shell-commands/no-interactive-login
     RUN mkdir /home/git/testuser && \
-        git init --bar /home/git/testuser/repo.git && \
+        git init --bare /home/git/testuser/repo.git && \
+        git -C /home/git/testuser/repo.git symbolic-ref HEAD refs/heads/main && \
         chown -R git:git /home/git/testuser
     COPY sshd_config /etc/ssh/sshd_config
-
 
     ARG SSHD_RSA="true"
     ARG SSHD_ED25519="true"

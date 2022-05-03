@@ -4,6 +4,95 @@ All notable changes to [Earthly](https://github.com/earthly/earthly) will be doc
 
 ## Unreleased
 
+### Changed
+
+- Switch to MPL-2.0 license. [Announcement](https://earthly.dev/blog/earthly-open-source)
+
+## v0.6.14 - 2022-04-11
+
+### Added
+
+- Experimental support for `SAVE IMAGE --no-manifest-list`. This option disables creating a multi-platform manifest list for the image, even if the image is created with a non-default platform. This allows the user to create non-native images (e.g. amd64 image on an M1 laptop) that are still compatible with AWS lambda. To enable this feature, please use `VERSION --use-no-manifest-list 0.6`. [#1802](https://github.com/earthly/earthly/pull/1802)
+- Introduced Experimental support for `--chmod` flag in `COPY`. To enable this feature, please use `VERSION --use-chmod 0.6`. [#1817](https://github.com/earthly/earthly/pull/1817)
+- Experimental `secret_provider` config option allows users to provide a script which returns secrets. [#1808](https://github.com/earthly/earthly/issues/1808)
+- `/etc/ssh/ssh_known_hosts` are now passed to buildkit. [#1769](https://github.com/earthly/earthly/issues/1769)
+
+### Fixed
+
+- Targets with the same `CACHE` commands incorrectly shared cached contents. [#1805](https://github.com/earthly/earthly/issues/1805)
+- Sometimes local outputs and pushes are skipped mistakenly when a target is referenced both via `FROM` and via `BUILD` [#1823](https://github.com/earthly/earthly/issues/1823)
+- `GIT CLONE` failure (`makeCloneURL does not support gitMatcher substitution`) when used with a self-hosted git repo that was configured under `~/.earthly/config.yml`  [#1757](https://github.com/earthly/earthly/issues/1757)
+
+## v0.6.13 - 2022-03-30
+
+### Added
+
+- Earthly now warns when encountering Earthfiles with no `VERSION` specified. In the future, the `VERSION` command will be mandatory. [#1775](https://github.com/earthly/earthly/pull/1775)
+
+### Changed
+
+- `WITH DOCKER` now merges changes into `/etc/docker/daemon.json` rather than overwriting the entire file; this change introduces `jq` as a dependency, which will
+  be auto-installed if missing.
+
+### Fixed
+
+- The `COPY` command, when used with `LOCALLY` was incorrectly ignoring the `WORKDIR` value. [#1792](https://github.com/earthly/earthly/issues/1792)
+- The `--shell-out-anywhere` feature introduced a bug which interfered with asynchronous builds. [#1785](https://github.com/earthly/earthly/issues/1785)
+- `EARTHLY_GIT_SHORT_HASH` was not set when building a remotely-referenced target. [#1787](https://github.com/earthly/earthly/issues/1787)
+
+## v0.6.12 - 2022-03-23
+
+### Changed
+
+- A more obvious error is printed if `WITH DOCKER` starts non-natively. This is not supported and it wasn't obvious before.
+- `WITH DOCKER` will keep any settings pre-applied in `/etc/docker/daemon.json` rather than overwriting them.
+
+### Added
+
+- The feature flag `--exec-after-build` has been enabled retroactively for `VERSION 0.5`. This speeds up largs builds by 15-20%.
+- The feature flag `--parallel-load` has been enabled for every `VERSION`. This speeds up by parallelizing targets built for loading via `WITH DOCKER --load`.
+- `VERSION 0.0` is now permitted, however it is only meant for Earthly internal debugging purposes. `VERSION 0.0` disables all feature flags.
+- A new experimental mode in which `--platform` operates. To enable these features in your builds, set `VERSION --new-platform 0.6`:
+  - There is now a distinction between **user** platform and **native** platform. The user platform is the platform of the user running Earthly, while the native platform is the platform of the build worker (these can be different when using a remote buildkit)
+  - New platform shorthands are provided: `--platform=native`, `--platform=user`.
+  - New builtin args are available: `NATIVEPLATFORM`, `NATIVEOS`, `NATIVEARCH`, `NATIVEVARIANT` (these are the equivalent of the `USER*` and `TARGET*` platform args).
+  - When no platform is provided, earthly will default to the **native** platform
+  - Additionally, earthly now default to native platform for internal operations too (copy operations, git clones etc)
+  - Earthly now allows changing the platform in the middle of a target (`FROM --platform` is not a contradiction anymore). There is a distinction between the "input" platform of a target (the platform the caller passes in) vs the "output" platform (the platform that ends up being the final platform of the image). These can be different if the caller passes `BUILD --platform=something +target`, but the target starts with `FROM --platform=otherthing ...`.
+- Ability to shell-out in any Earthly command, (e.g. `SAVE IMAGE myimage:$(cat version)`), as well as in the middle of ARG strings. To enable this feature, use `VERSION --shell-out-anywhere 0.6`.
+
+### Fixed
+
+- An experimental fix for duplicate output when building images that are loaded via `WITH DOCKER --load`. This can be enabled via `VERSION --no-tar-build-output 0.6`.
+
+## v0.6.11 - 2022-03-17
+
+### Added
+
+- An experimental feature whereby `WITH DOCKER` parallelizes building of the
+  images to be loaded has been added. To enable this feature use
+  `VERSION --parallel-load 0.6`. [#1725](https://github.com/earthly/earthly/pull/1725)
+- Added `cache_size_pct` config option to allow specifying cache size as a percentage of disk space.
+
+### Fixed
+
+- Fixed a duplicate build issue when using `IF` together with `WITH DOCKER` [#1724](https://github.com/earthly/earthly/issues/1724)
+- Fixed a bug where `BUILD --platform=$ARG` did not expand correctly
+- Fixed issue preventing use of `WITH DOCKER` with docker systemd-based images such as `kind`, when used under hosts with cgroups v2.
+
+## v0.6.10 - 2022-03-03
+
+### Changed
+
+- reverted zeroing of mtime change that was introduced in v0.6.9; this restores the behavior of setting modification time to `2020-04-16T12:00`. [#1712](https://github.com/earthly/earthly/issues/1712)
+
+## v0.6.9 - 2022-03-02
+
+### Changed
+
+- Log sharing is enabled by default for logged in users, it can be disabled with `earthly config global.disable_log_sharing true`.
+- `SAVE ARTIFACT ... AS LOCAL` now sets mtime of output artifacts to the current time.
+
 ### Added
 
 - Earthly is now 15-30% faster when executing large builds [#1589](https://github.com/earthly/earthly/issues/1589)
@@ -16,6 +105,13 @@ All notable changes to [Earthly](https://github.com/earthly/earthly) will be doc
 - Podman can now use the local registry cache without modifying `registries.conf` [#1675](https://github.com/earthly/earthly/pull/1675)
 - Podman can now use `WITH DOCKER --load` inside a target marked as `LOCALLY` [#1675](https://github.com/earthly/earthly/pull/1675)
 - Interactive sessions should now work with rootless configurations that have no apparent external IP address [#1573](https://github.com/earthly/earthly/issues/1573), [#1689](https://github.com/earthly/earthly/pull/1689)
+- On native Windows installations, Earthly properly detects the local git path when it's available [#1663](https://github.com/earthly/earthly/issues/1663)
+- On native Windows installations, Earthly will properly identify targets in Earthfiles outside of the current directory using the `\` file separator  [#1663](https://github.com/earthly/earthly/issues/1663)
+- On native Windows installations, Earthly will save local artifacts to directories using the `\` file separator [#1663](https://github.com/earthly/earthly/issues/1663)
+- A parsing error, when using `WITH DOCKER --load` in conjunction with new-style
+  build args. [#1696](https://github.com/earthly/earthly/issues/1696)
+- `ENTRYPOINT` and `CMD` were not properly expanding args when used in shell mode.
+- A race condition sometimes caused a `Canceled` error to be reported, instead of the real error that caused the build to fail
 
 ## v0.6.8 - 2022-02-16
 

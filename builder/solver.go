@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/earthly/earthly/domain"
+	"github.com/earthly/earthly/outmon"
 	"github.com/earthly/earthly/states"
 	"github.com/earthly/earthly/states/image"
 	"github.com/earthly/earthly/util/llbutil/pllb"
@@ -29,7 +30,7 @@ type onFinalArtifactFunc func(context.Context) (string, error)
 type onReadyForPullFunc func(context.Context, []string) error
 
 type solver struct {
-	sm              *solverMonitor
+	sm              *outmon.SolverMonitor
 	bkClient        *client.Client
 	attachables     []session.Attachable
 	enttlmnts       []entitlements.Entitlement
@@ -39,7 +40,7 @@ type solver struct {
 	saveInlineCache bool
 }
 
-func (s *solver) solveDockerTar(ctx context.Context, state pllb.State, platform specs.Platform, img *image.Image, dockerTag string, outFile string) error {
+func (s *solver) solveDockerTar(ctx context.Context, state pllb.State, platform specs.Platform, img *image.Image, dockerTag string, outFile string, printOutput bool) error {
 	dt, err := state.Marshal(ctx, llb.Platform(platform))
 	if err != nil {
 		return errors.Wrap(err, "state marshal")
@@ -64,8 +65,22 @@ func (s *solver) solveDockerTar(ctx context.Context, state pllb.State, platform 
 	var vertexFailureOutput string
 	eg.Go(func() error {
 		var err error
-		vertexFailureOutput, err = s.sm.monitorProgress(ctx, ch, "", true)
-		return err
+		if printOutput {
+			vertexFailureOutput, err = s.sm.MonitorProgress(ctx, ch, "", true)
+			return err
+		}
+		// Silent case.
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case _, ok := <-ch:
+				if !ok {
+					return nil
+				}
+				// Do nothing - just consume the status updates silently.
+			}
+		}
 	})
 	eg.Go(func() error {
 		file, err := os.Create(outFile)
@@ -112,55 +127,28 @@ func (s *solver) buildMainMulti(ctx context.Context, bf gwclient.BuildFunc, onIm
 	if err != nil {
 		return errors.Wrap(err, "new solve opt")
 	}
+	var buildErr error
 	eg.Go(func() error {
 		var err error
 		_, err = s.bkClient.Build(ctx, *solveOpt, "", bf, ch)
 		if err != nil {
-			return errors.Wrap(err, "bkClient.Build")
+			// The actual error from bkClient.Build sometimes races with
+			// a context cancelled in the solver monitor.
+			buildErr = err
+			return err
 		}
 		return nil
 	})
 	var vertexFailureOutput string
 	eg.Go(func() error {
 		var err error
-		vertexFailureOutput, err = s.sm.monitorProgress(ctx, ch, phaseText, false)
+		vertexFailureOutput, err = s.sm.MonitorProgress(ctx, ch, phaseText, false)
 		return err
 	})
 	err = eg.Wait()
-	if err != nil {
-		return NewBuildError(err, vertexFailureOutput)
+	if buildErr != nil {
+		return NewBuildError(buildErr, vertexFailureOutput)
 	}
-	return nil
-}
-
-func (s *solver) solveMain(ctx context.Context, state pllb.State, platform specs.Platform) error {
-	dt, err := state.Marshal(ctx, llb.Platform(platform))
-	if err != nil {
-		return errors.Wrap(err, "state marshal")
-	}
-	solveOpt, err := s.newSolveOptMain()
-	if err != nil {
-		return errors.Wrap(err, "new solve opt")
-	}
-	ch := make(chan *client.SolveStatus)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	eg, ctx := errgroup.WithContext(ctx)
-	eg.Go(func() error {
-		var err error
-		_, err = s.bkClient.Solve(ctx, dt, *solveOpt, ch)
-		if err != nil {
-			return errors.Wrap(err, "solve")
-		}
-		return nil
-	})
-	var vertexFailureOutput string
-	eg.Go(func() error {
-		var err error
-		vertexFailureOutput, err = s.sm.monitorProgress(ctx, ch, "", true)
-		return err
-	})
-	err = eg.Wait()
 	if err != nil {
 		return NewBuildError(err, vertexFailureOutput)
 	}
@@ -251,18 +239,6 @@ func (s *solver) newSolveOptMulti(ctx context.Context, eg *errgroup.Group, onIma
 		CacheExports:        cacheExports,
 		Session:             s.attachables,
 		AllowedEntitlements: s.enttlmnts,
-	}, nil
-}
-
-func (s *solver) newSolveOptMain() (*client.SolveOpt, error) {
-	var cacheImports []client.CacheOptionsEntry
-	for ci := range s.cacheImports.AsMap() {
-		cacheImports = append(cacheImports, newCacheImportOpt(ci))
-	}
-	return &client.SolveOpt{
-		Session:             s.attachables,
-		AllowedEntitlements: s.enttlmnts,
-		CacheImports:        cacheImports,
 	}, nil
 }
 

@@ -59,6 +59,7 @@ var (
 type GlobalConfig struct {
 	DisableAnalytics         bool     `yaml:"disable_analytics"          help:"Controls Earthly telemetry."`
 	BuildkitCacheSizeMb      int      `yaml:"cache_size_mb"              help:"Size of the buildkit cache in Megabytes."`
+	BuildkitCacheSizePct     int      `yaml:"cache_size_pct"             help:"Size of the buildkit cache, as percentage (0-100)."`
 	BuildkitImage            string   `yaml:"buildkit_image"             help:"Choose a specific image for your buildkitd."`
 	BuildkitRestartTimeoutS  int      `yaml:"buildkit_restart_timeout_s" help:"How long to wait for buildkit to (re)start, in seconds."`
 	BuildkitAdditionalArgs   []string `yaml:"buildkit_additional_args"   help:"Additional args to pass to buildkit when it starts. Useful for custom/self-signed certs, or user namespace complications."`
@@ -78,6 +79,7 @@ type GlobalConfig struct {
 	ContainerFrontend        string   `yaml:"container_frontend"         help:"What program should be used to start and stop buildkitd, save images. Default is 'docker'. Valid options are 'docker' and 'podman' (experimental)."`
 	IPTables                 string   `yaml:"ip_tables"                  help:"Which iptables binary to use. Valid values are iptables-legacy or iptables-nft. Bypasses any autodetection."`
 	DisableLogSharing        bool     `yaml:"disable_log_sharing"        help:"Disable cloud log sharing when logged in with an Earthly account, see https://ci.earthly.dev for details."`
+	SecretProvider           string   `yaml:"secret_provider"            help:"Command to execute to retrieve secret."`
 
 	// Obsolete.
 	CachePath      string `yaml:"cache_path"         help:" *Deprecated* The path to keep Earthly's cache."`
@@ -98,10 +100,17 @@ type GitConfig struct {
 	StrictHostKeyChecking *bool  `yaml:"strict_host_key_checking"     help:"Allow ssh access to hosts with unknown server keys (e.g. no entries in known_hosts), defaults to true."`
 }
 
+// Satellite contains satellite config values
+type Satellite struct {
+	Name string `yaml:"name" help:"The name of the satellite to use"`
+	Org  string `yaml:"org"  help:"The org to whom the satellite belongs"`
+}
+
 // Config contains user's configuration values from ~/earthly/config.yml
 type Config struct {
-	Global GlobalConfig         `yaml:"global" help:"Global configuration object. Requires YAML literal to set directly."`
-	Git    map[string]GitConfig `yaml:"git"    help:"Git configuration object. Requires YAML literal to set directly."`
+	Global    GlobalConfig         `yaml:"global"    help:"Global configuration object. Requires YAML literal to set directly."`
+	Git       map[string]GitConfig `yaml:"git"       help:"Git configuration object. Requires YAML literal to set directly."`
+	Satellite Satellite            `yaml:"satellite" help:"Satellite remote building configuration. Overrides some other remote buildkit settings when present. Requires YAML literal to set directly"`
 }
 
 // ParseConfigFile parse config data
@@ -110,6 +119,7 @@ func ParseConfigFile(yamlData []byte) (*Config, error) {
 	config := Config{
 		Global: GlobalConfig{
 			BuildkitCacheSizeMb:     0,
+			BuildkitCacheSizePct:    0,
 			DebuggerPort:            DefaultDebuggerPort,
 			LocalRegistryHost:       fmt.Sprintf("tcp://127.0.0.1:%d", DefaultLocalRegistryPort),
 			BuildkitScheme:          DefaultBuildkitScheme,
@@ -217,7 +227,7 @@ func Delete(config []byte, path string) ([]byte, error) {
 }
 
 // PrintHelp describes the provided config option by
-// printing it's type and help tags to the console.
+// printing its type and help tags to the console.
 func PrintHelp(path string) error {
 	t, help, err := validatePath(reflect.TypeOf(Config{}), splitPath(path))
 	if err != nil {
@@ -228,7 +238,7 @@ func PrintHelp(path string) error {
 }
 
 func splitPath(path string) []string {
-	// Allow quotes to group keys, since git repos are keys and have periods... this is why we dont just strings.Split
+	// Allow quotes to group keys, since git repos are keys and have periods... this is why we don't just strings.Split
 	// If you screw up the quotes you will get a weird invalid path later.
 	re := regexp.MustCompile(`[^\."']+|"([^"]*)"|'([^']*)`)
 	pathParts := re.FindAllString(path, -1)
@@ -283,7 +293,7 @@ func valueToYaml(value string) (*yaml.Node, error) {
 		return nil, errors.Errorf("%s is not a valid YAML value", value)
 	}
 
-	// Unfold all the yaml so its not mixed inline and flow styles in the final document
+	// Unfold all the yaml so it's not mixed inline and flow styles in the final document
 	var fixStyling func(node *yaml.Node)
 	fixStyling = func(node *yaml.Node) {
 		node.Style = 0
@@ -296,7 +306,7 @@ func valueToYaml(value string) (*yaml.Node, error) {
 
 	contentNode := &yaml.Node{}
 	if len(valueNode.Content) > 0 {
-		// ContentNode contains the user-provided value with it's type etc
+		// ContentNode contains the user-provided value with its type etc
 		contentNode = valueNode.Content[0]
 	} else if value == "" {
 		// Edge case where the yaml.Unmarshal above results in no nodes in valueNode.Content.

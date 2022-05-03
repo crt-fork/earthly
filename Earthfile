@@ -1,4 +1,4 @@
-VERSION 0.6
+VERSION --shell-out-anywhere --use-copy-link 0.6
 
 FROM golang:1.17-alpine3.14
 
@@ -22,9 +22,9 @@ WORKDIR /earthly
 
 deps:
     FROM +base
-    RUN go get golang.org/x/tools/cmd/goimports
-    RUN go get golang.org/x/lint/golint
-    RUN go get github.com/gordonklaus/ineffassign
+    RUN go install golang.org/x/tools/cmd/goimports@latest
+    RUN go install golang.org/x/lint/golint@latest
+    RUN go install github.com/gordonklaus/ineffassign@latest
     COPY go.mod go.sum ./
     RUN go mod download
     SAVE ARTIFACT go.mod AS LOCAL go.mod
@@ -40,9 +40,10 @@ code:
         RUN go mod edit -replace github.com/moby/buildkit=/buildkit
         RUN go mod download
     END
-    COPY --platform=linux/amd64 ./ast/parser+parser/*.go ./ast/parser/
+    ARG USERARCH
+    COPY --platform=linux/$USERARCH ./ast/parser+parser/*.go ./ast/parser/
     COPY --dir analytics autocomplete buildcontext builder cleanup cmd config conslogging debugger dockertar \
-        docker2earthly domain features slog cloud states util variables ./
+        docker2earthly domain features outmon slog cloud states util variables ./
     COPY --dir buildkitd/buildkitd.go buildkitd/settings.go buildkitd/certificates.go buildkitd/
     COPY --dir earthfile2llb/*.go earthfile2llb/
     COPY --dir ast/antlrhandler ast/spec ast/*.go ast/
@@ -97,6 +98,21 @@ lint-scripts:
     BUILD +lint-scripts-auth-test
     BUILD +lint-scripts-misc
 
+earthly-script-no-stdout:
+    # This validates the ./earthly script doesn't print anything to stdout (it should print to stderr)
+    # This is to ensure commands such as: MYSECRET="$(./earthly secrets get -n /user/my-secret)" work
+    FROM earthly/dind:alpine
+    RUN apk add --no-cache --update bash
+    COPY earthly .earthly_version_flag_overrides .
+
+    # This script performs an explicit "docker pull earthlybinaries:prerelease" which can cause rate-limiting
+    # to work-around this, we will copy an earthly binary in, and disable auto-updating (and therefore don't require a WITH DOCKER)
+    COPY +earthly/earthly /root/.earthly/earthly-prerelease
+    RUN EARTHLY_DISABLE_AUTO_UPDATE=true ./earthly --version > earthly-version-output
+
+    RUN test "$(cat earthly-version-output | wc -l)" = "1"
+    RUN grep '^earthly version.*$' earthly-version-output # only --version info should go to stdout
+
 lint:
     FROM +code
     RUN output="$(ineffassign ./... 2>&1 | grep -v '/earthly/ast/parser/.*\.go')" ; \
@@ -104,7 +120,7 @@ lint:
             echo "$output" ; \
             exit 1 ; \
         fi
-    RUN output="$(goimports -d $(find . -type f -name '*.go' | grep -v \.pb\.go) 2>&1)"  ; \
+    RUN output="$(goimports -d $(find . -type f -name '*.go' | grep -v \./ast/parser/.*\.go) 2>&1)"  ; \
         if [ -n "$output" ]; then \
             echo "$output" ; \
             exit 1 ; \
@@ -152,7 +168,7 @@ lint-newline-ending:
     # check for files with trailing newlines
     RUN set -e; \
         code=0; \
-        for f in $(find . -type f \( -iname '*.go' -o -iname 'Earthfile' -o -iname '*.earth' -o -iname '*.md' \) | grep -v "ast/tests/empty-targets.earth" ); do \
+        for f in $(find . -type f \( -iname '*.go' -o -iname 'Earthfile' -o -iname '*.earth' -o -iname '*.md' \) | grep -v "ast/tests/empty-targets.earth" | grep -v "ast/parser/earth_parser.go" | grep -v "ast/parser/earth_lexer.go" ); do \
             if [ "$(tail -c 2 $f)" == "$(printf '\n\n')" ]; then \
                 echo "$f has trailing newlines"; \
                 code=1; \
@@ -177,9 +193,9 @@ markdown-spellcheck:
 
 unit-test:
     FROM +code
-    RUN apk add --no-cache --update podman
+    COPY podman-setup.sh .
     WITH DOCKER
-        RUN sed -i 's/\/var\/lib\/containers\/storage/$EARTHLY_DOCKERD_DATA_ROOT/g' /etc/containers/storage.conf && \
+        RUN ./podman-setup.sh && \
             go test ./...
     END
 
@@ -238,7 +254,7 @@ earthly:
     ARG VERSION="dev-$EARTHLY_TARGET_TAG_DOCKER"
     ARG EARTHLY_GIT_HASH
     ARG DEFAULT_BUILDKITD_IMAGE=docker.io/earthly/buildkitd:$VERSION # The image needs to be fully qualified for alternative frontend support.
-    ARG BUILD_TAGS=dfrunmount dfrunsecurity dfsecrets dfssh dfrunnetwork dfheredoc
+    ARG BUILD_TAGS=dfrunmount dfrunsecurity dfsecrets dfssh dfrunnetwork dfheredoc forceposix
     ARG GOCACHE=/go-cache
     RUN mkdir -p build
     RUN printf "$BUILD_TAGS" > ./build/tags && echo "$(cat ./build/tags)"
@@ -340,12 +356,13 @@ earthly-integration-test-base:
 
     # The inner buildkit requires Docker hub creds to prevent rate-limiting issues.
     ARG DOCKERHUB_MIRROR
+    ARG DOCKERHUB_MIRROR_INSECURE
     ARG DOCKERHUB_AUTH=true
     ARG DOCKERHUB_USER_SECRET=+secrets/DOCKERHUB_USER
     ARG DOCKERHUB_TOKEN_SECRET=+secrets/DOCKERHUB_TOKEN
 
     IF [ -z $DOCKERHUB_MIRROR ]
-    # No mirror, easy CI and local use by all
+        # No mirror, easy CI and local use by all
         ENV GLOBAL_CONFIG="{disable_analytics: true, local_registry_host: 'tcp://127.0.0.1:8371', conversion_parallelism: 5}"
         IF [ "$DOCKERHUB_AUTH" = "true" ]
             RUN --secret USERNAME=$DOCKERHUB_USER_SECRET \
@@ -353,12 +370,25 @@ earthly-integration-test-base:
                 docker login --username="$USERNAME" --password="$TOKEN"
         END
     ELSE
-    # Use a mirror, supports mirroring Docker Hub only.
-        ENV GLOBAL_CONFIG="{disable_analytics: true, local_registry_host: 'tcp://127.0.0.1:8371', conversion_parallelism: 5, buildkit_additional_config: '[registry.\"docker.io\"]
-
-                           mirrors = [\"$DOCKERHUB_MIRROR\"]'}"
+        # Use a mirror, supports mirroring Docker Hub only.
         ENV EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="[registry.\"docker.io\"]
-                    mirrors = [\"registry-1.docker.io.mirror.corp.earthly.dev\"]"
+  mirrors = [\"$DOCKERHUB_MIRROR\"]"
+
+        IF [ "$DOCKERHUB_MIRROR_INSECURE" = "true" ]
+            ENV EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="$EARTHLY_ADDITIONAL_BUILDKIT_CONFIG
+[registry.\"$DOCKERHUB_MIRROR\"]
+  http = true
+  insecure = true"
+        END
+
+        # NOTE: newlines+indentation is important here, see https://github.com/earthly/earthly/issues/1764 for potential pitfalls
+        # yaml will convert newlines to spaces when using regular quoted-strings, therefore we will use the literal-style (denoted by `|`)
+        ENV GLOBAL_CONFIG="disable_analytics: true
+local_registry_host: 'tcp://127.0.0.1:8371'
+conversion_parallelism: 5
+buildkit_additional_config: |
+$(echo "$EARTHLY_ADDITIONAL_BUILDKIT_CONFIG" | sed "s/^/  /g")
+"
         IF [ "$DOCKERHUB_AUTH" = "true" ]
             RUN --secret USERNAME=$DOCKERHUB_USER_SECRET \
                 --secret TOKEN=$DOCKERHUB_TOKEN_SECRET \
@@ -389,7 +419,8 @@ dind:
 
 dind-alpine:
     FROM docker:dind
-    RUN apk add --update --no-cache docker-compose
+    COPY ./buildkitd/docker-auto-install.sh /usr/local/bin/docker-auto-install.sh
+    RUN docker-auto-install.sh
     ARG EARTHLY_TARGET_TAG_DOCKER
     ARG DIND_ALPINE_TAG=alpine-$EARTHLY_TARGET_TAG_DOCKER
     ARG DOCKERHUB_USER=earthly
@@ -413,27 +444,27 @@ for-own:
 for-linux:
     ARG BUILDKIT_PROJECT
     BUILD --platform=linux/amd64 ./buildkitd+buildkitd --BUILDKIT_PROJECT="$BUILDKIT_PROJECT"
-    BUILD --platform=linux/amd64 ./ast/parser+parser
+    BUILD ./ast/parser+parser
     COPY +earthly-linux-amd64/earthly ./
     SAVE ARTIFACT ./earthly AS LOCAL ./build/linux/amd64/earthly
 
 for-darwin:
     ARG BUILDKIT_PROJECT
     BUILD --platform=linux/amd64 ./buildkitd+buildkitd --BUILDKIT_PROJECT="$BUILDKIT_PROJECT"
-    BUILD --platform=linux/amd64 ./ast/parser+parser
+    BUILD ./ast/parser+parser
     COPY +earthly-darwin-amd64/earthly ./
     SAVE ARTIFACT ./earthly AS LOCAL ./build/darwin/amd64/earthly
 
 for-darwin-m1:
     ARG BUILDKIT_PROJECT
     BUILD --platform=linux/arm64 ./buildkitd+buildkitd --BUILDKIT_PROJECT="$BUILDKIT_PROJECT"
-    BUILD --platform=linux/amd64 ./ast/parser+parser
+    BUILD ./ast/parser+parser
     COPY +earthly-darwin-arm64/earthly ./
     SAVE ARTIFACT ./earthly AS LOCAL ./build/darwin/arm64/earthly
 
 for-windows:
     # BUILD --platform=linux/amd64 ./buildkitd+buildkitd
-    # BUILD --platform=linux/amd64 ./ast/parser+parser
+    BUILD ./ast/parser+parser
     COPY +earthly-windows-amd64/earthly.exe ./
     SAVE ARTIFACT ./earthly.exe AS LOCAL ./build/windows/amd64/earthly.exe
 
@@ -464,7 +495,9 @@ test:
     BUILD +lint-newline-ending
     BUILD +lint-changelog
     BUILD +unit-test
+    BUILD +earthly-script-no-stdout
     ARG DOCKERHUB_MIRROR
+    ARG DOCKERHUB_MIRROR_INSECURE=false
     ARG DOCKERHUB_AUTH=true
     ARG DOCKERHUB_USER_SECRET=+secrets/DOCKERHUB_USER
     ARG DOCKERHUB_TOKEN_SECRET=+secrets/DOCKERHUB_TOKEN
@@ -472,16 +505,19 @@ test:
         --DOCKERHUB_AUTH=$DOCKERHUB_AUTH \
         --DOCKERHUB_USER_SECRET=$DOCKERHUB_USER_SECRET \
         --DOCKERHUB_TOKEN_SECRET=$DOCKERHUB_TOKEN_SECRET \
-        --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR
+        --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR \
+        --DOCKERHUB_MIRROR_INSECURE=$DOCKERHUB_MIRROR_INSECURE
     BUILD ./tests+ga \
         --DOCKERHUB_AUTH=$DOCKERHUB_AUTH \
         --DOCKERHUB_USER_SECRET=$DOCKERHUB_USER_SECRET \
         --DOCKERHUB_TOKEN_SECRET=$DOCKERHUB_TOKEN_SECRET \
-        --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR
+        --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR \
+        --DOCKERHUB_MIRROR_INSECURE=$DOCKERHUB_MIRROR_INSECURE
 
 test-all:
     BUILD +examples
     ARG DOCKERHUB_MIRROR
+    ARG DOCKERHUB_MIRROR_INSECURE=false
     ARG DOCKERHUB_AUTH=true
     ARG DOCKERHUB_USER_SECRET=+secrets/DOCKERHUB_USER
     ARG DOCKERHUB_TOKEN_SECRET=+secrets/DOCKERHUB_TOKEN
@@ -489,12 +525,14 @@ test-all:
         --DOCKERHUB_AUTH=$DOCKERHUB_AUTH \
         --DOCKERHUB_USER_SECRET=$DOCKERHUB_USER_SECRET \
         --DOCKERHUB_TOKEN_SECRET=$DOCKERHUB_TOKEN_SECRET \
-        --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR
+        --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR \
+        --DOCKERHUB_MIRROR_INSECURE=$DOCKERHUB_MIRROR_INSECURE
     BUILD ./tests+experimental  \
         --DOCKERHUB_AUTH=$DOCKERHUB_AUTH \
         --DOCKERHUB_USER_SECRET=$DOCKERHUB_USER_SECRET \
         --DOCKERHUB_TOKEN_SECRET=$DOCKERHUB_TOKEN_SECRET \
-        --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR
+        --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR \
+        --DOCKERHUB_MIRROR_INSECURE=$DOCKERHUB_MIRROR_INSECURE
 
 examples:
     BUILD +examples1
@@ -544,3 +582,7 @@ examples2:
     BUILD github.com/earthly/hello-world:main+hello
     BUILD ./examples/cache-command/npm+docker
     BUILD ./examples/cache-command/mvn+docker
+
+license:
+    COPY LICENSE ./
+    SAVE ARTIFACT LICENSE

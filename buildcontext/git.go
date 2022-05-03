@@ -10,11 +10,15 @@ import (
 
 	"github.com/earthly/earthly/analytics"
 	"github.com/earthly/earthly/cleanup"
+	"github.com/earthly/earthly/conslogging"
 	"github.com/earthly/earthly/domain"
+	"github.com/earthly/earthly/features"
+	"github.com/earthly/earthly/outmon"
 	"github.com/earthly/earthly/util/gitutil"
 	"github.com/earthly/earthly/util/llbutil"
 	"github.com/earthly/earthly/util/llbutil/llbfactory"
 	"github.com/earthly/earthly/util/llbutil/pllb"
+	"github.com/earthly/earthly/util/platutil"
 	"github.com/earthly/earthly/util/stringutil"
 	"github.com/earthly/earthly/util/syncutil/synccache"
 
@@ -33,11 +37,14 @@ type gitResolver struct {
 	projectCache   *synccache.SyncCache // "gitURL#gitRef" -> *resolvedGitProject
 	buildFileCache *synccache.SyncCache // project ref -> local path
 	gitLookup      *GitLookup
+	console        conslogging.ConsoleLogger
 }
 
 type resolvedGitProject struct {
 	// hash is the git hash.
 	hash string
+	// shortHash is the short git hash.
+	shortHash string
 	// branches is the git branches.
 	branches []string
 	// tags is the git tags.
@@ -48,11 +55,11 @@ type resolvedGitProject struct {
 	state pllb.State
 }
 
-func (gr *gitResolver) resolveEarthProject(ctx context.Context, gwClient gwclient.Client, ref domain.Reference, featureFlagOverrides string) (*Data, error) {
+func (gr *gitResolver) resolveEarthProject(ctx context.Context, gwClient gwclient.Client, platr *platutil.Resolver, ref domain.Reference, featureFlagOverrides string) (*Data, error) {
 	if !ref.IsRemote() {
 		return nil, errors.Errorf("unexpected local reference %s", ref.String())
 	}
-	rgp, gitURL, subDir, err := gr.resolveGitProject(ctx, gwClient, ref)
+	rgp, gitURL, subDir, err := gr.resolveGitProject(ctx, gwClient, platr, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -64,20 +71,25 @@ func (gr *gitResolver) resolveEarthProject(ctx context.Context, gwClient gwclien
 			// Optimization.
 			buildContextFactory = llbfactory.PreconstructedState(rgp.state)
 		} else {
+			vm := &outmon.VertexMeta{
+				TargetName: ref.String(),
+				Internal:   true,
+			}
 			buildContextFactory = llbfactory.PreconstructedState(llbutil.CopyOp(
-				rgp.state, []string{subDir}, llbutil.ScratchWithPlatform(), "./", false, false, false, "root:root", false, false,
-				llb.WithCustomNamef("[internal] COPY git context %s", ref.String())))
+				rgp.state, []string{subDir}, platr.Scratch(), "./", false, false, false, "root:root", nil, false, false, false,
+				llb.WithCustomNamef("%sCOPY git context %s", vm.ToVertexPrefix(), ref.String())))
 		}
 	} else {
 		// Commands don't come with a build context.
 	}
 
 	key := ref.ProjectCanonical()
-	if strings.HasPrefix(ref.GetName(), DockerfileMetaTarget) {
+	isDockerfile := strings.HasPrefix(ref.GetName(), DockerfileMetaTarget)
+	if isDockerfile {
 		// Different key for dockerfiles to include the dockerfile name itself.
 		key = ref.StringCanonical()
 	}
-	localBuildFilePathValue, err := gr.buildFileCache.Do(ctx, key, func(ctx context.Context, _ interface{}) (interface{}, error) {
+	localBuildFileValue, err := gr.buildFileCache.Do(ctx, key, func(ctx context.Context, _ interface{}) (interface{}, error) {
 		earthfileTmpDir, err := os.MkdirTemp(os.TempDir(), "earthly-git")
 		if err != nil {
 			return nil, errors.Wrap(err, "create temp dir for Earthfile")
@@ -85,55 +97,65 @@ func (gr *gitResolver) resolveEarthProject(ctx context.Context, gwClient gwclien
 		gr.cleanCollection.Add(func() error {
 			return os.RemoveAll(earthfileTmpDir)
 		})
-		gitState, err := llbutil.StateToRef(ctx, gwClient, rgp.state, false, nil, nil)
+		gitState, err := llbutil.StateToRef(
+			ctx, gwClient, rgp.state, false,
+			platr.SubResolver(platutil.NativePlatform), nil)
 		if err != nil {
 			return nil, errors.Wrap(err, "state to ref git meta")
 		}
-		buildFile, err := detectBuildFileInRef(ctx, ref, gitState, subDir)
+		bf, err := detectBuildFileInRef(ctx, ref, gitState, subDir)
 		if err != nil {
 			return nil, err
 		}
-		buildFileBytes, err := gitState.ReadFile(ctx, gwclient.ReadRequest{
-			Filename: buildFile,
+		bfBytes, err := gitState.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: bf,
 		})
 		if err != nil {
 			return nil, errors.Wrap(err, "read build file")
 		}
-		localBuildFilePath := filepath.Join(earthfileTmpDir, path.Base(buildFile))
-		err = os.WriteFile(localBuildFilePath, buildFileBytes, 0700)
+		localBuildFilePath := filepath.Join(earthfileTmpDir, path.Base(bf))
+		err = os.WriteFile(localBuildFilePath, bfBytes, 0700)
 		if err != nil {
 			return nil, errors.Wrapf(err, "write build file to tmp dir at %s", localBuildFilePath)
 		}
-		return localBuildFilePath, nil
+		var ftrs *features.Features
+		if isDockerfile {
+			ftrs = new(features.Features)
+		} else {
+			ftrs, err = parseFeatures(localBuildFilePath, featureFlagOverrides, ref.ProjectCanonical(), gr.console)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &buildFile{
+			path: localBuildFilePath,
+			ftrs: ftrs,
+		}, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	localBuildFilePath := localBuildFilePathValue.(string)
-
-	ftrs, err := parseFeatures(localBuildFilePath, featureFlagOverrides)
-	if err != nil {
-		return nil, err
-	}
+	localBuildFile := localBuildFileValue.(*buildFile)
 
 	// TODO: Apply excludes / .earthignore.
 	return &Data{
-		BuildFilePath:       localBuildFilePath,
+		BuildFilePath:       localBuildFile.path,
 		BuildContextFactory: buildContextFactory,
 		GitMetadata: &gitutil.GitMetadata{
 			BaseDir:   "",
 			RelDir:    subDir,
 			RemoteURL: gitURL,
 			Hash:      rgp.hash,
+			ShortHash: rgp.shortHash,
 			Branch:    rgp.branches,
 			Tags:      rgp.tags,
 			Timestamp: rgp.ts,
 		},
-		Features: ftrs,
+		Features: localBuildFile.ftrs,
 	}, nil
 }
 
-func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.Client, ref domain.Reference) (rgp *resolvedGitProject, gitURL string, subDir string, finalErr error) {
+func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.Client, platr *platutil.Resolver, ref domain.Reference) (rgp *resolvedGitProject, gitURL string, subDir string, finalErr error) {
 	gitRef := ref.GetTag()
 
 	var err error
@@ -148,8 +170,12 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 	cacheKey := fmt.Sprintf("%s#%s", gitURL, gitRef)
 	rgpValue, err := gr.projectCache.Do(ctx, cacheKey, func(ctx context.Context, k interface{}) (interface{}, error) {
 		// Copy all Earthfile, build.earth and Dockerfile files.
+		vm := &outmon.VertexMeta{
+			TargetName: cacheKey,
+			Internal:   true,
+		}
 		gitOpts := []llb.GitOption{
-			llb.WithCustomNamef("[internal] GIT CLONE %s", stringutil.ScrubCredentials(gitURL)),
+			llb.WithCustomNamef("%sGIT CLONE %s", vm.ToVertexPrefix(), stringutil.ScrubCredentials(gitURL)),
 			llb.KeepGitDir(),
 		}
 		if len(keyScans) > 0 {
@@ -159,13 +185,14 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 		gitState := llb.Git(gitURL, gitRef, gitOpts...)
 		opImg := pllb.Image(
 			defaultGitImage, llb.MarkImageInternal, llb.ResolveModePreferLocal,
-			llb.Platform(llbutil.DefaultPlatform()))
+			llb.Platform(platr.LLBNative()))
 
 		// Get git hash.
 		gitHashOpts := []llb.RunOption{
 			llb.Args([]string{
 				"/bin/sh", "-c",
 				"git rev-parse HEAD >/dest/git-hash ; " +
+					"git rev-parse --short=8 HEAD >/dest/git-short-hash ; " +
 					"git rev-parse --abbrev-ref HEAD >/dest/git-branch  || touch /dest/git-branch ; " +
 					"git describe --exact-match --tags >/dest/git-tags || touch /dest/git-tags ; " +
 					"git log -1 --format=%ct >/dest/git-ts || touch /dest/git-ts",
@@ -173,13 +200,15 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 			llb.Dir("/git-src"),
 			llb.ReadonlyRootFS(),
 			llb.AddMount("/git-src", gitState, llb.Readonly),
-			llb.WithCustomNamef("[internal] GET GIT META %s", ref.ProjectCanonical()),
+			llb.WithCustomNamef("%sGET GIT META %s", vm.ToVertexPrefix(), ref.ProjectCanonical()),
 		}
 		gitHashOp := opImg.Run(gitHashOpts...)
-		gitMetaState := gitHashOp.AddMount("/dest", llbutil.ScratchWithPlatform())
+		gitMetaState := gitHashOp.AddMount("/dest", platr.Scratch())
 
 		noCache := false // TODO figure out if we want to propagate --no-cache here
-		gitMetaRef, err := llbutil.StateToRef(ctx, gwClient, gitMetaState, noCache, nil, nil)
+		gitMetaRef, err := llbutil.StateToRef(
+			ctx, gwClient, gitMetaState, noCache,
+			platr.SubResolver(platutil.NativePlatform), nil)
 		if err != nil {
 			return nil, errors.Wrap(err, "state to ref git meta")
 		}
@@ -188,6 +217,12 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 		})
 		if err != nil {
 			return nil, errors.Wrap(err, "read git-hash")
+		}
+		gitShortHashBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: "git-short-hash",
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "read git-short-hash")
 		}
 		gitBranchBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
 			Filename: "git-branch",
@@ -209,6 +244,7 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 		}
 
 		gitHash := strings.SplitN(string(gitHashBytes), "\n", 2)[0]
+		gitShortHash := strings.SplitN(string(gitShortHashBytes), "\n", 2)[0]
 		gitBranches := strings.SplitN(string(gitBranchBytes), "\n", 2)
 		var gitBranches2 []string
 		for _, gitBranch := range gitBranches {
@@ -234,10 +270,11 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 		}
 
 		rgp := &resolvedGitProject{
-			hash:     gitHash,
-			branches: gitBranches2,
-			tags:     gitTags2,
-			ts:       gitTs,
+			hash:      gitHash,
+			shortHash: gitShortHash,
+			branches:  gitBranches2,
+			tags:      gitTags2,
+			ts:        gitTs,
 			state: pllb.Git(
 				gitURL,
 				gitHash,

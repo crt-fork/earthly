@@ -7,11 +7,10 @@ import (
 	"github.com/earthly/earthly/domain"
 	"github.com/earthly/earthly/states/dedup"
 	"github.com/earthly/earthly/states/image"
-	"github.com/earthly/earthly/util/llbutil"
 	"github.com/earthly/earthly/util/llbutil/pllb"
+	"github.com/earthly/earthly/util/platutil"
 	"github.com/earthly/earthly/variables"
 	"github.com/google/uuid"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // MultiTarget holds LLB states representing multiple earthly targets,
@@ -40,7 +39,7 @@ type SingleTarget struct {
 	// ID is a random unique string.
 	ID                     string
 	Target                 domain.Target
-	Platform               *specs.Platform
+	PlatformResolver       *platutil.Resolver
 	MainImage              *image.Image
 	MainState              pllb.State
 	ArtifactsState         pllb.State
@@ -61,6 +60,12 @@ type SingleTarget struct {
 	// RanInteractive represents whether we have encountered an --interactive command.
 	RanInteractive bool
 
+	// doSavesMu is a mutex for doSave.
+	doSavesMu sync.Mutex
+	// doSaves indicates whether the SaveImages and the SaveLocals should be
+	// actually saved (and possibly pushed).
+	doSaves bool
+
 	// doneCh is a channel that is closed when the sts is complete.
 	doneCh chan struct{}
 
@@ -75,20 +80,20 @@ type SingleTarget struct {
 	incomingNewSubscriptions chan string
 }
 
-func newSingleTarget(ctx context.Context, target domain.Target, platform *specs.Platform, allowPrivileged bool, overridingVars *variables.Scope, parentDepSub chan string) (*SingleTarget, error) {
+func newSingleTarget(ctx context.Context, target domain.Target, platr *platutil.Resolver, allowPrivileged bool, overridingVars *variables.Scope, parentDepSub chan string) (*SingleTarget, error) {
 	targetStr := target.StringCanonical()
 	sts := &SingleTarget{
-		ID:       uuid.New().String(),
-		Target:   target,
-		Platform: platform,
+		ID:               uuid.New().String(),
+		Target:           target,
+		PlatformResolver: nil, // Will be set in converter's FinalizeStates.
 		targetInput: dedup.TargetInput{
 			TargetCanonical: targetStr,
-			Platform:        llbutil.PlatformWithDefaultToString(platform),
+			Platform:        platr.Materialize(platr.Current()).String(),
 			AllowPrivileged: allowPrivileged,
 		},
-		MainState:                llbutil.ScratchWithPlatform(),
+		MainState:                platr.Scratch(),
 		MainImage:                image.NewImage(),
-		ArtifactsState:           llbutil.ScratchWithPlatform(),
+		ArtifactsState:           platr.Scratch(),
 		dependentIDs:             make(map[string]bool),
 		doneCh:                   make(chan struct{}),
 		incomingNewSubscriptions: make(chan string, 1024),
@@ -121,16 +126,26 @@ OuterLoop:
 	return sts, nil
 }
 
+// GetDoSaves returns whether the SaveImages and the SaveLocals should be
+// actually saved (and possibly pushed).
+func (sts *SingleTarget) GetDoSaves() bool {
+	sts.doSavesMu.Lock()
+	defer sts.doSavesMu.Unlock()
+	return sts.doSaves
+}
+
+// SetDoSaves sets the DoSaves flag.
+func (sts *SingleTarget) SetDoSaves() {
+	sts.doSavesMu.Lock()
+	defer sts.doSavesMu.Unlock()
+	sts.doSaves = true
+}
+
 // TargetInput returns the target input in a concurrent-safe way.
 func (sts *SingleTarget) TargetInput() dedup.TargetInput {
 	sts.tiMu.Lock()
 	defer sts.tiMu.Unlock()
 	return sts.targetInput
-}
-
-// SetPlatform sets the sts platform.
-func (sts *SingleTarget) SetPlatform(platform *specs.Platform) {
-	sts.Platform = platform
 }
 
 // AddBuildArgInput adds a bai to the sts's target input.
@@ -239,11 +254,15 @@ type SaveImage struct {
 	// provided.
 	CacheHint           bool
 	HasPushDependencies bool
-	// DoSave indicates whether the image should be saved and (possibly pushed).
-	DoSave bool
+	// ForceSave indicates whether the image should be force-saved and (possibly pushed).
+	ForceSave bool
 	// CheckDuplicate indicates whether to check if the image name shows up
 	// multiple times during output.
 	CheckDuplicate bool
+	// NoManifestList indicates that the image should not include a manifest
+	// list (usually used for multi-platform setups). This means that the image
+	// can only be a single-platform image.
+	NoManifestList bool
 }
 
 // RunPush is a series of RUN --push commands to be run after the build has been deemed as

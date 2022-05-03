@@ -48,7 +48,14 @@ Each recipe contains a series of commands, which are defined below. For an intro
 
 #### Description
 
-The `FROM` command initializes a new build environment and sets the base image for subsequent instructions. It works similarly to the classical [Dockerfile `FROM` instruction](https://docs.docker.com/engine/reference/builder/#from), but it has the added ability to use another target's image as the base image for the build. For example: `FROM +another-target`.
+The `FROM` command initializes a new build environment and sets the base image for subsequent instructions. It works similarly to the classical [Dockerfile `FROM` instruction](https://docs.docker.com/engine/reference/builder/#from), but it has the added ability to use another [target](https://docs.earthly.dev/docs/guides/target-ref#target-reference)'s image as the base image.
+
+Examples:
+
+* Classical reference: `FROM alpine:latest`
+* Local reference: `FROM +another-target`
+* Relative reference: `FROM ./subdirectory+some-target`
+* Remote reference from a public or [private](https://docs.earthly.dev/docs/guides/auth) git repository: `FROM github.com/example/project+remote-target`
 
 The `FROM` command does not mark any saved images or artifacts of the referenced target for output, nor does it mark any push commands of the referenced target for pushing. For that, please use [`BUILD`](#build).
 
@@ -351,7 +358,7 @@ The classical form of the `COPY` command differs from Dockerfiles in two cases:
 
 {% hint style='info' %}
 ##### Note
-To prevent Earthly from copying unwanted files, you may specify file patterns to be excluded from the build context using an [`.earthignore`](./earthignore.md) file. This file has the same syntax as a [`.dockerignore` file](https://docs.docker.com/engine/reference/builder/#dockerignore-file).
+To prevent Earthly from copying unwanted files, you may specify file patterns to be excluded from the build context using an [`.earthlyignore`](./earthlyignore.md) file. This file has the same syntax as a [`.dockerignore` file](https://docs.docker.com/engine/reference/builder/#dockerignore-file).
 {% endhint %}
 
 #### Options
@@ -484,13 +491,16 @@ For detailed examples demonstrating how other scenarios may function, please see
 
 #### Synopsis
 
-* `ARG [--required] <name>[=<default-value>]`
+* `ARG [--required] <name>[=<default-value>]` (constant form)
+* `ARG [--required] <name>=$(<default-value-expr>)` (dynamic form)
 
 #### Description
 
 The command `ARG` declares a variable (or arg) with the name `<name>` and with an optional default value `<default-value>`. If no default value is provided, then empty string is used as the default value.
 
 This command works similarly to the [Dockerfile `ARG` command](https://docs.docker.com/engine/reference/builder/#arg), with a few differences regarding the scope and the predefined args (called builtin args in Earthly). The variable's scope is always limited to the recipe of the current target or command and only from the point it is declared onward. For more information regarding builtin args, see the [builtin args page](./builtin-args.md).
+
+In its *constant form*, the arg takes a default value defined as a constant string. If the `<default-value>` is not provided, then the default value is an empty string. In its *dynamic form*, the arg takes a default value defined as an expression. The expression is evaluated at run time and its result is used as the default value. The expression is interpreted via the default shell (`/bin/sh -c`) within the build environment.
 
 If an `ARG` is defined in the `base` target of the Earthfile, then it becomes a global `ARG` and it is made available to every other target or command in that file, regardless of their base images used.
 
@@ -533,6 +543,14 @@ build-linux:
     # or explicitly supply in build command
     BUILD +target-required --NAME=john
 ```
+
+{% hint style='info' %}
+Earthly, by default, only supports dynamic values which start with the `$(...)` shell-out syntax -- passing
+a value such as `--name="the honourable $(whoami)"` will fail to execute the `whoami` program.
+
+This behaviour can be changed with the experimental [`VERSION` `--shell-out-anywhere` feature flag](../earthfile/features#feature-flags).
+This feature additionally allows shelling-out in *any* earthly command.
+{% endhint %}
 
 ## SAVE ARTIFACT
 
@@ -666,13 +684,13 @@ The command `BUILD` instructs Earthly to additionally invoke the build of the ta
 {% hint style='info' %}
 ##### What is being output and pushed
 
-In Earthly v0.6+, what is being output and pushed is determined either by the main target beeing invoked on the command-line directly, or by targets directly connected to it via a chain of `BUILD` calls. Other ways to reference a target, such as `FROM`, `COPY`, `WITH DOCKER --load` etc, do not contribute to the final set of outputs or pushes.
+In Earthly v0.6+, what is being output and pushed is determined either by the main target being invoked on the command-line directly, or by targets directly connected to it via a chain of `BUILD` calls. Other ways to reference a target, such as `FROM`, `COPY`, `WITH DOCKER --load` etc, do not contribute to the final set of outputs or pushes.
 
 If you are referencing a target via some other command, such as `COPY` and you would like for the outputs or pushes to be included, you can issue an equivalent `BUILD` command in addition to the `COPY`. For example
 
 ```Dockerfile
 my-target:
-    COPY --plattform=linux/amd64 (+some-target/some-file.txt --FOO=bar) ./
+    COPY --platform=linux/amd64 (+some-target/some-file.txt --FOO=bar) ./
 ```
 
 Should be amended with the following additional `BUILD` call:
@@ -704,11 +722,13 @@ or an expression involving other build args
 --SOME_ARG="a value based on other args, like $ANOTHER_ARG and $YET_ANOTHER_ARG"
 ```
 
-or a dynamic expression, based on the output of a command executed in the context of the build environment. In this case, the build arg becomes a "variable build arg".
+or a dynamic expression, based on the output of a command executed in the context of the build environment.
 
 ```
 --SOME_ARG=$(find /app -type f -name '*.php')
 ```
+
+Dynamic expressions are delimited by `$(...)`.
 
 ##### `--platform <platform>`
 
@@ -1349,7 +1369,7 @@ The `USER` command sets the user name (or UID) and optionally the user group (or
 
 #### Description
 
-The `WORKDIR` command `strs` the working directory for other commands that follow in the recipe. The working directory is also persisted as the default directory for the image. If the directory does not exist, it is automatically created. This command works the same way as the [Dockerfile `WORKDIR` command](https://docs.docker.com/engine/reference/builder/#workdir).
+The `WORKDIR` command sets the working directory for following commands in the recipe. The working directory is also persisted as the default directory for the image. If the directory does not exist, it is automatically created. This command works the same way as the [Dockerfile `WORKDIR` command](https://docs.docker.com/engine/reference/builder/#workdir).
 
 ## HEALTHCHECK (same as Dockerfile HEALTHCHECK)
 
@@ -1379,6 +1399,25 @@ Sets an initialization time period in which failures are not counted towards the
 ##### `--retries=N`
 
 Sets the number of retries before a container is considered `unhealthy`. Defaults to `3`.
+
+## HOST (experimental)
+
+{% hint style='info' %}
+##### Note
+The `HOST` command is experimental and must be enabled by enabling the `--use-host-command` flag, e.g.
+
+```Dockerfile
+VERSION --use-host-command 0.6
+```
+{% endhint %}
+
+#### Synopsis
+
+* `HOST <hostname> <ip>`
+
+#### Description
+
+The `HOST` command creates a hostname entry (under `/etc/hosts`) that causes `<hostname>` to resolve to the specified `<ip>` address.
 
 ## SHELL (not supported)
 

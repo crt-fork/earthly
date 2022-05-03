@@ -1,12 +1,14 @@
 package llbutil
 
 import (
+	"github.com/earthly/earthly/outmon"
 	"github.com/earthly/earthly/util/llbutil/pllb"
+	"github.com/earthly/earthly/util/platutil"
 	"github.com/moby/buildkit/client/llb"
 )
 
 // WithDependency creates a fake dependency between two states.
-func WithDependency(state pllb.State, depState pllb.State, stateStr, depStr string, opts ...llb.RunOption) pllb.State {
+func WithDependency(state pllb.State, depState pllb.State, stateStr, depStr string, platr *platutil.Resolver, opts ...llb.RunOption) pllb.State {
 	// TODO: Is there a better way to mark two states as depending on each other?
 	if depState.Output() == nil {
 		// depState is Scratch.
@@ -15,7 +17,10 @@ func WithDependency(state pllb.State, depState pllb.State, stateStr, depStr stri
 
 	// Copy a wildcard that could never exist.
 	// (And allow for the wildcard to match nothing).
-	interm := ScratchWithPlatform()
+	interm := platr.Scratch()
+	vm := &outmon.VertexMeta{
+		Internal: true,
+	}
 	interm = interm.File(pllb.Copy(
 		depState, "/fake-745cb405-fbfb-4ea7-83b0-a85c26b4aff0-*", "/tmp/",
 		&llb.CopyInfo{
@@ -23,7 +28,11 @@ func WithDependency(state pllb.State, depState pllb.State, stateStr, depStr stri
 			AllowWildcard:       true,
 			AllowEmptyWildcard:  true,
 			CopyDirContentsOnly: true,
-		}), llb.WithCustomNamef("[internal] (fakecopy1) %s depends on %s", stateStr, depStr))
+		}),
+		llb.WithCustomNamef(
+			"%s(fakecopy1) %s depends on %s",
+			vm.ToVertexPrefix(), stateStr, depStr),
+	)
 
 	// Do this again. The extra step is needed to prevent the need for BuildKit
 	// to re-hash the input in certain cases (can be slow if depState is large).
@@ -34,5 +43,9 @@ func WithDependency(state pllb.State, depState pllb.State, stateStr, depStr stri
 			AllowWildcard:       true,
 			AllowEmptyWildcard:  true,
 			CopyDirContentsOnly: true,
-		}), llb.WithCustomNamef("[internal] (fakecopy2) %s depends on %s", stateStr, depStr))
+		}),
+		llb.WithCustomNamef(
+			"%s(fakecopy2) %s depends on %s",
+			vm.ToVertexPrefix(), stateStr, depStr),
+	)
 }

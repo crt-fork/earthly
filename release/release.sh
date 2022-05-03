@@ -8,6 +8,7 @@ set -ex
 # - downloading the binaries from github and existing binaries from s3 buckets
 # - signing those apt and yum packages containing those binaries
 # - and pushing signed up to s3 buckets (which back our apt and yum repos)
+# - building an AMI for the latest version
 
 # Args
 #   Required
@@ -51,6 +52,7 @@ export EARTHLY_REPO=${EARTHLY_REPO:-earthly}
 export BREW_REPO=${BREW_REPO:-homebrew-earthly}
 export GITHUB_SECRET_PATH=$GITHUB_SECRET_PATH
 export PRERELEASE=${PRERELEASE:-false}
+export SKIP_CHANGELOG_DATE_TEST=${SKIP_CHANGELOG_DATE_TEST:-false}
 
 
 if [ "$PRERELEASE" != "false" ] && [ "$PRERELEASE" != "true" ]; then
@@ -71,7 +73,7 @@ if [ -z "$earthly" ]; then
 fi
 
 # fail-fast if release-notes do not exist (or if date is incorrect)
-"$earthly" --build-arg DOCKERHUB_USER --build-arg RELEASE_TAG +release-notes
+"$earthly" --build-arg DOCKERHUB_USER --build-arg RELEASE_TAG --build-arg SKIP_CHANGELOG_DATE_TEST +release-notes
 
 if [ -n "$GITHUB_SECRET_PATH" ]; then
     GITHUB_SECRET_PATH_BUILD_ARG="--build-arg GITHUB_SECRET_PATH=$GITHUB_SECRET_PATH"
@@ -80,9 +82,11 @@ else
 fi
 
 release_apt_and_yum="false"
+release_ami="false"
 if [ "$GITHUB_USER" = "earthly" ] && [ "$EARTHLY_REPO" = "earthly" ]; then
     ("$earthly" secrets get /user/earthly-technologies/aws/credentials >/dev/null) || (echo "ERROR: user-secrets /user/earthly-technologies/aws/credentials does not exist"; exit 1);
     release_apt_and_yum="true"
+    release_ami="true"
 fi
 
 existing_release=$(curl -s https://api.github.com/repos/earthly/earthly/releases/tags/$RELEASE_TAG | jq -r .tag_name)
@@ -92,7 +96,7 @@ if [ "$existing_release" != "null" ]; then
 fi
 
 "$earthly" --push --build-arg DOCKERHUB_USER --build-arg RELEASE_TAG +release-dockerhub
-"$earthly" --push --build-arg GITHUB_USER --build-arg EARTHLY_REPO --build-arg BREW_REPO --build-arg DOCKERHUB_USER --build-arg RELEASE_TAG --build-arg PRERELEASE="$PRERELEASE" $GITHUB_SECRET_PATH_BUILD_ARG +release-github
+"$earthly" --push --build-arg GITHUB_USER --build-arg EARTHLY_REPO --build-arg BREW_REPO --build-arg DOCKERHUB_USER --build-arg RELEASE_TAG --build-arg SKIP_CHANGELOG_DATE_TEST --build-arg PRERELEASE="$PRERELEASE" $GITHUB_SECRET_PATH_BUILD_ARG +release-github
 
 if [ "$PRERELEASE" != "false" ]; then
     echo "exiting due to prerelease = true"
@@ -113,4 +117,11 @@ if [ "$release_apt_and_yum" = "true" ]; then
     "$earthly" --push --build-arg RELEASE_TAG ./yum-repo+build-and-release
 else
     echo "WARNING: there is no staging environment for apt or yum repos"
+fi
+
+if [ "$release_ami" = "true" ]; then
+  "$earthly" --push --build-arg RELEASE_TAG ./ami+update-pipelines
+  "$earthly" --push --build-arg RELEASE_TAG ./ami+build-ami
+else
+  echo "WARNING: there is no staging environment for AMIs"
 fi

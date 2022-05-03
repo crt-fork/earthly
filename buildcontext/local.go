@@ -3,25 +3,29 @@ package buildcontext
 import (
 	"context"
 	"path/filepath"
+	"strings"
 
 	"github.com/earthly/earthly/analytics"
 	"github.com/earthly/earthly/conslogging"
 	"github.com/earthly/earthly/domain"
+	"github.com/earthly/earthly/features"
 	"github.com/earthly/earthly/util/gitutil"
-	"github.com/earthly/earthly/util/llbutil"
 	"github.com/earthly/earthly/util/llbutil/llbfactory"
+	"github.com/earthly/earthly/util/platutil"
 	"github.com/earthly/earthly/util/syncutil/synccache"
 	"github.com/moby/buildkit/client/llb"
+	gwclient "github.com/moby/buildkit/frontend/gateway/client"
 	"github.com/pkg/errors"
 )
 
 type localResolver struct {
-	gitMetaCache *synccache.SyncCache // local path -> *gitutil.GitMetadata
-	sessionID    string
-	console      conslogging.ConsoleLogger
+	gitMetaCache   *synccache.SyncCache // local path -> *gitutil.GitMetadata
+	sessionID      string
+	buildFileCache *synccache.SyncCache
+	console        conslogging.ConsoleLogger
 }
 
-func (lr *localResolver) resolveLocal(ctx context.Context, ref domain.Reference, featureFlagOverrides string) (*Data, error) {
+func (lr *localResolver) resolveLocal(ctx context.Context, gwClient gwclient.Client, platr *platutil.Resolver, ref domain.Reference, featureFlagOverrides string) (*Data, error) {
 	analytics.Count("localResolver.resolveLocal", "local-reference")
 	if ref.IsRemote() {
 		return nil, errors.Errorf("unexpected remote target %s", ref.String())
@@ -51,18 +55,40 @@ func (lr *localResolver) resolveLocal(ctx context.Context, ref domain.Reference,
 	}
 	metadata := metadataValue.(*gitutil.GitMetadata)
 
-	buildFilePath, err := detectBuildFile(ref, filepath.FromSlash(ref.GetLocalPath()))
+	localPath := filepath.FromSlash(ref.GetLocalPath())
+	key := localPath
+	isDockerfile := strings.HasPrefix(ref.GetName(), DockerfileMetaTarget)
+	if isDockerfile {
+		// Different key for dockerfiles to include the dockerfile name itself.
+		key = ref.String()
+	}
+	buildFileValue, err := lr.buildFileCache.Do(ctx, key, func(ctx context.Context, _ interface{}) (interface{}, error) {
+		buildFilePath, err := detectBuildFile(ref, localPath)
+		if err != nil {
+			return nil, err
+		}
+		var ftrs *features.Features
+		if isDockerfile {
+			ftrs = new(features.Features)
+		} else {
+			ftrs, err = parseFeatures(buildFilePath, featureFlagOverrides, ref.GetLocalPath(), lr.console)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return &buildFile{
+			path: buildFilePath,
+			ftrs: ftrs,
+		}, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	ftrs, err := parseFeatures(buildFilePath, featureFlagOverrides)
-	if err != nil {
-		return nil, err
-	}
+	bf := buildFileValue.(*buildFile)
 
 	var buildContextFactory llbfactory.Factory
 	if _, isTarget := ref.(domain.Target); isTarget {
-		noImplicitIgnore := ftrs != nil && ftrs.NoImplicitIgnore
+		noImplicitIgnore := bf.ftrs != nil && bf.ftrs.NoImplicitIgnore
 		excludes, err := readExcludes(ref.GetLocalPath(), noImplicitIgnore)
 		if err != nil {
 			return nil, err
@@ -71,7 +97,7 @@ func (lr *localResolver) resolveLocal(ctx context.Context, ref domain.Reference,
 			ref.GetLocalPath(),
 			llb.ExcludePatterns(excludes),
 			llb.SessionID(lr.sessionID),
-			llb.Platform(llbutil.DefaultPlatform()),
+			llb.Platform(platr.LLBNative()),
 			llb.WithCustomNamef("[context %s] local context %s", ref.GetLocalPath(), ref.GetLocalPath()),
 		)
 	} else {
@@ -79,9 +105,9 @@ func (lr *localResolver) resolveLocal(ctx context.Context, ref domain.Reference,
 	}
 
 	return &Data{
-		BuildFilePath:       buildFilePath,
+		BuildFilePath:       bf.path,
 		BuildContextFactory: buildContextFactory,
 		GitMetadata:         metadata,
-		Features:            ftrs,
+		Features:            bf.ftrs,
 	}, nil
 }

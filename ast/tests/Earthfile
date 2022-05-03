@@ -6,6 +6,7 @@ WORKDIR /test
 ARG DOCKERHUB_USER_SECRET=+secrets/DOCKERHUB_USER
 ARG DOCKERHUB_TOKEN_SECRET=+secrets/DOCKERHUB_TOKEN
 ARG DOCKERHUB_MIRROR
+ARG DOCKERHUB_MIRROR_INSECURE=false
 ARG DOCKERHUB_AUTH=true
 
 COPY ../..+earthly/earthly /usr/local/bin/earthly
@@ -38,6 +39,7 @@ all:
         --TEST=host-bind \
         --TEST=if-exists \
         --TEST=lc \
+        --TEST=new-args \
         --TEST=no-cache-local-artifact \
         --TEST=non-transitive-args1 \
         --TEST=non-transitive-args2 \
@@ -55,6 +57,7 @@ all:
         --TEST=with-docker-compose \
         --TEST=command \
         --TEST=import
+    BUILD +test --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=args
     BUILD +test --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=if
     BUILD +test --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=for
     BUILD +test --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=empty-targets
@@ -88,6 +91,7 @@ update-all:
         --TEST=host-bind \
         --TEST=if-exists \
         --TEST=lc \
+        --TEST=new-args \
         --TEST=no-cache-local-artifact \
         --TEST=non-transitive-args1 \
         --TEST=non-transitive-args2 \
@@ -105,6 +109,7 @@ update-all:
         --TEST=with-docker-compose \
         --TEST=command \
         --TEST=import
+    BUILD +update-expected --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=args
     BUILD +update-expected --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=if
     BUILD +update-expected --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=for
     BUILD +update-expected --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=empty-targets
@@ -149,5 +154,6 @@ INPUT_COPY:
                 --DOCKERHUB_USER_SECRET=$DOCKERHUB_USER_SECRET \
                 --DOCKERHUB_TOKEN_SECRET=$DOCKERHUB_TOKEN_SECRET \
                 --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR \
+                --DOCKERHUB_MIRROR_INSECURE=$DOCKERHUB_MIRROR_INSECURE \
             ) .
     END
