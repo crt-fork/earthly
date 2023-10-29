@@ -82,8 +82,32 @@ However, environment variable authentication are now deprecated in favor of usin
 
 #### Self-hosted and private Git Repositories
 
-Currently, `github.com`, `gitlab.com`, and `bitbucket.org` have been tested as SCM providers. In order to use self-hosted git repositories
-such as GitHub enterprise you will need to configure Earthly to use them using a regular expression:
+Currently, `github.com`, `gitlab.com`, and `bitbucket.org` have been tested as SCM providers. Without any host-specific configuration,
+Earthly first attempts to perform a clone over SSH on the default SSH port (22), and will fallback to HTTPS, followed by HTTP.
+In the event access can only be established over HTTP, Earthly will refuse to send credentials due to the insecure nature of HTTP.
+
+Earthly can be configured to use a non-standard SSH port, by using the `port` config option:
+
+```yaml
+git:
+    ghe.internal.mycompany.com:
+        auth: ssh
+        user: git
+        port: 2222
+```
+
+When Earthly encounters a remote reference such as `ghe.internal.mycompany.com/user/repo+some-target`,
+the git repository will be cloned using an explicit SSH scheme, for example:
+`git clone ssh://git@ghe.internal.mycompany.com:2222/user/repo.git`.
+
+The explicit ssh-scheme is an absolute path on the server's file-system; if the git repositories are located in a different location
+(e.g. `/var/git/...`), a `prefix` configuration option can be specified.
+
+{% hint style='info' %}
+##### Remapping Git Repositories Paths Using Regular Expressions
+
+The `port` and `prefix` configuration options are the preferred way to configure self-hosted git repositories; however
+prior to the introduction of these options, it was suggested to use a regular expression and substitution pattern:
 
 ```yaml
 git:
@@ -92,6 +116,53 @@ git:
         substitute: 'ssh://git@ghe.internal.mycompany.com:22/$1/$2.git'
         auth: ssh
 ```
+{% endhint %}
+
+#### GitLab Subgroups
+
+Earthly, by default, assumes git repos are stored under two levels (i.e. `<org>/<path>.git`). A regular expression must be configured in order to support sub groups:
+
+```yaml
+git:
+    gitlab.com:
+        pattern: 'gitlab.com/(example-org)/([^/]+)/([^/]+)'
+        substitute: 'git@gitlab.com:$1/$2/$3.git'
+        auth: ssh
+```
+
+Where `example-org` is the name of your GitLab organisation. Note that the `(` and `)` parenthesis are required, as they are used to assign the matched value to the `$1`, `$2`, ... values.
+
+The pattern will depend on how your subgroups are setup; if you use a mix of 2 and 3 level groupings, you will have to configure them separately:
+
+```yaml
+git:
+    gitlab.com/example-org/projecta:
+        pattern: 'gitlab.com/(example-org)/(project-a)/([^/]+)'
+        substitute: 'git@gitlab.com:$1/$2/$3.git'
+        auth: ssh
+
+    gitlab.com example-org catch-all:
+        pattern: 'gitlab.com/(example-org)/([^/]+)'
+        substitute: 'git@gitlab.com:$1/$2.git'
+        auth: ssh
+```
+
+When a `pattern` is used, the key of the git configuration is simply used by log messages, it is **not** used for any matching.
+
+Note that patterns are evaluated from the top to the bottom, subgroup specific configurations should be listed first.
+
+#### Debugging tips
+
+You can run earthly with `--verbose`, which will provide debugging messages to help understand how a remote earthly reference is transformed into a git URL for cloning.
+
+You can additionally enable low-level git debugging in buildkit, by adding the following to your `~/.earthly/config.yml`:
+
+```yaml
+global:
+  buildkit_additional_args: [ '-e', 'BUILDKIT_DEBUG_GIT=1' ]
+```
+
+The buildkit logs can be displayed with `docker logs earthly-buildkitd`.
 
 ## Docker authentication
 

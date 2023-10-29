@@ -1,11 +1,11 @@
-VERSION 0.6
+VERSION 0.7
 
-FROM alpine:3.15
-ARG TARGETARCH
-IF [ "$TARGETARCH" = "arm64" ]
+FROM alpine:3.18
+ARG NATIVEARCH
+IF [ "$NATIVEARCH" = "arm64" ]
     FROM arm64v8/openjdk:19-slim
 ELSE
-    FROM --platform=linux/amd64 openjdk:19-slim
+    FROM --platform="linux/$NATIVEARCH" openjdk:19-slim
 END
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install antlr.
 WORKDIR /usr/local/lib
-ARG ANTLR_VERSION=4.9.1
+ARG --global ANTLR_VERSION=4.12.0
+RUN echo curl -O https://www.antlr.org/download/antlr-${ANTLR_VERSION}-complete.jar
 RUN curl -O https://www.antlr.org/download/antlr-${ANTLR_VERSION}-complete.jar
 WORKDIR /earthly
 
@@ -43,9 +44,9 @@ test-not-committed:
     RUN diff -qr ./locally ./generated
 
 rrd-antlr4:
-    FROM maven:3.6.3-jdk-11
+    FROM maven:3.8.6-jdk-11
     WORKDIR /rrd-antlr4
-    ENV RRD_SHA 4cedafca603f64ae1e26b597444a7bfd33d0f37e
+    ENV RRD_SHA c41b36b68fa29d2ba82847395caf87c8c1da4efc
     RUN curl -L https://github.com/bkiers/rrd-antlr4/archive/$RRD_SHA.zip > rrdantlr4.zip
     RUN unzip rrdantlr4.zip
     WORKDIR rrd-antlr4-$RRD_SHA

@@ -19,7 +19,7 @@ Let's consider a "hello world" example that allows us to change who is being gre
 We will create a hello target that accepts the `name` argument:
 
 ```Dockerfile
-VERSION 0.6
+VERSION 0.7
 FROM alpine:latest
 
 hello:
@@ -108,10 +108,10 @@ Argument values can be set multiple ways:
 
     This may be useful if you have a set of build args that you'd like to always use and would prefer not to have to specify them on the command line every time. The `EARTHLY_BUILD_ARGS` environment variable may also be stored in your `~/.bashrc` file, or some other shell-specific startup script.
 
-4. From a `.env` file
+4. From an `.arg` file
 
-   It is also possible to create an `.env` file to contain the build arguments to pass
-   to earthly. First create an `.env` file with:
+   It is also possible to create an `.arg` file to contain the build arguments to pass
+   to earthly. First create an `.arg` file with:
    
    ```
    name=eggplant
@@ -168,7 +168,7 @@ WITH DOCKER --load=(+hello --name=world)
 END
 ```
 
-Another way to pass build args is by specifying a dynamic value, delimited by `$(...)`. For example, in the following, the value of the arg `name` will be set as the ouptut of the shell command `echo world` (which, of course is simply `world`):
+Another way to pass build args is by specifying a dynamic value, delimited by `$(...)`. For example, in the following, the value of the arg `name` will be set as the output of the shell command `echo world` (which, of course is simply `world`):
 
 ```Dockerfile
 BUILD +hello --name=$(echo world)
@@ -178,15 +178,15 @@ BUILD +hello --name=$(echo world)
 
 Secrets are similar to build arguments; however, they are *not* defined in targets, but instead are explicitly defined for each `RUN` command that is permitted to access them.
 
-Here's an example Earthfile that accesses a secret stored under `+secrets/passwd` and exposes it under the environment variable `mypassword`:
+Here's an example Earthfile that accesses a secret stored under `passwd` and exposes it under the environment variable `mypassword`:
 
 ```dockerfile
 FROM alpine:latest
 hush:
-    RUN --secret mypassword=+secrets/passwd echo "my password is $mypassword"
+    RUN --secret mypassword=passwd echo "my password is $mypassword"
 ```
 
-If the environment variable name is identical to the secret ID. For example to accesses a secret stored under `+secrets/passwd` and exposes it under the environment variable `passwd`  you can use the shorthand :
+If the environment variable name is identical to the secret ID. For example to accesses a secret stored under `passwd` and exposes it under the environment variable `passwd`  you can use the shorthand :
 
 ```dockerfile
 FROM alpine:latest
@@ -198,7 +198,7 @@ hush:
 It's also possible to temporarily mount a secret as a file:
 
 ```dockerfile
-RUN --mount type=secret,target=/root/mypassword,id=+secrets/passwd echo "my password is $(cat /root/mypassword)"
+RUN --mount type=secret,target=/root/mypassword,id=passwd echo "my password is $(cat /root/mypassword)"
 ```
 
 The file will not be saved to the image snapshot.
@@ -206,7 +206,7 @@ The file will not be saved to the image snapshot.
 
 ## Setting secret values
 
-The value for `+secrets/passwd` in examples above must then be supplied when earthly is invoked.
+The value for `passwd` in examples above must then be supplied when earthly is invoked.
 
 This is possible in a few ways:
 
@@ -235,9 +235,9 @@ This is possible in a few ways:
 
    Multiple secrets can be specified by separating them with a comma.
 
-4. Via the `.env` file.
+4. Via the `.secret` file.
 
-   Create a `.env` file in the same directory where you plan to run `earthly` from. Its contents should be:
+   Create a `.secret` file in the same directory where you plan to run `earthly` from. Its contents should be:
    
    ```
    passwd=itsasecret
@@ -249,7 +249,7 @@ This is possible in a few ways:
    earthly +hello
    ```
 
-5. Via cloud-based secrets. This option helps share secrets within a wider team. To read more about this see the [cloud-based secrets guide](cloud-secrets.md).
+5. Via cloud-based secrets. This option helps share secrets within a wider team. To read more about this see the [cloud-based secrets guide](../cloud/cloud-secrets.md).
 
 Regardless of the approach chosen from above, once earthly is invoked, in our example, it will output:
 
@@ -278,4 +278,4 @@ until the earthly command exits.
 
 Earthly also supports cloud-based shared secrets which can be stored in the cloud. Secrets are never stored in the cloud unless a user creates an earthly account and
 explicitly calls the `earthly secrets set ...` command to transmit the secret to the earthly cloud-based secrets server.
-For more information about cloud-based secrets, check out our [cloud-based secrets management guide](cloud-secrets.md).
+For more information about cloud-based secrets, check out our [cloud-based secrets management guide](../cloud/cloud-secrets.md).

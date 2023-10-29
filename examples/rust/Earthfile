@@ -1,9 +1,9 @@
-VERSION 0.6
-FROM rust:1.59
+VERSION 0.7
+FROM rust:1.72
 WORKDIR /rustexample
 
 install-chef:
-   RUN cargo install --debug cargo-chef
+    RUN cargo install --debug cargo-chef
 
 prepare-cache:
     FROM +install-chef
@@ -15,13 +15,12 @@ prepare-cache:
 build-cache:
     FROM +install-chef
     COPY +prepare-cache/recipe.json ./
-    RUN cargo chef cook
-    SAVE ARTIFACT target
-    SAVE ARTIFACT $CARGO_HOME cargo_home
+    CACHE target
+    RUN cargo chef cook --release
 
 build:
+    FROM +build-cache
     COPY --dir src Cargo.lock Cargo.toml .
-    COPY +build-cache/cargo_home $CARGO_HOME
     RUN cargo build --release --bin example-rust
     SAVE ARTIFACT target/release/example-rust example-rust
 

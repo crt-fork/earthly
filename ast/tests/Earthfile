@@ -1,13 +1,7 @@
-VERSION 0.6
-FROM alpine:3.15
+VERSION --pass-args 0.7
+FROM alpine:3.18
 RUN apk add jq
 WORKDIR /test
-
-ARG DOCKERHUB_USER_SECRET=+secrets/DOCKERHUB_USER
-ARG DOCKERHUB_TOKEN_SECRET=+secrets/DOCKERHUB_TOKEN
-ARG DOCKERHUB_MIRROR
-ARG DOCKERHUB_MIRROR_INSECURE=false
-ARG DOCKERHUB_AUTH=true
 
 COPY ../..+earthly/earthly /usr/local/bin/earthly
 
@@ -62,6 +56,7 @@ all:
     BUILD +test --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=for
     BUILD +test --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=empty-targets
     BUILD +test --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=quotes
+    BUILD +test --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=documentation
 
 update-all:
     BUILD +update-expected \
@@ -114,6 +109,7 @@ update-all:
     BUILD +update-expected --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=for
     BUILD +update-expected --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=empty-targets
     BUILD +update-expected --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=quotes
+    BUILD +update-expected --INPUT_FROM_DIR=./ --INPUT_FROM_TARGET="" --TEST=documentation
 
 # Note: If this test fails for expected reasons (eg format of AST has changed), you can
 #       update the expectations via +update-all. Please review the resulting diff
@@ -122,7 +118,7 @@ test:
     ARG --required TEST
     ARG INPUT_FROM_DIR=../../tests
     ARG INPUT_FROM_TARGET=ast-test-input
-    DO +INPUT_COPY --TEST=$TEST --INPUT_FROM_DIR=$INPUT_FROM_DIR --INPUT_FROM_TARGET=$INPUT_FROM_TARGET
+    DO --pass-args +INPUT_COPY --TEST=$TEST --INPUT_FROM_DIR=$INPUT_FROM_DIR --INPUT_FROM_TARGET=$INPUT_FROM_TARGET
     COPY ${TEST}.ast.json ./expected.json
     RUN jq -S . ./expected.json >./expected.pretty.json
     RUN earthly debug ast ${TEST}.earth >./actual.json
@@ -133,7 +129,7 @@ update-expected:
     ARG --required TEST
     ARG INPUT_FROM_DIR=../../tests
     ARG INPUT_FROM_TARGET=ast-test-input
-    DO +INPUT_COPY --TEST=$TEST --INPUT_FROM_DIR=$INPUT_FROM_DIR --INPUT_FROM_TARGET=$INPUT_FROM_TARGET
+    DO --pass-args +INPUT_COPY --TEST=$TEST --INPUT_FROM_DIR=$INPUT_FROM_DIR --INPUT_FROM_TARGET=$INPUT_FROM_TARGET
     RUN earthly debug ast ${TEST}.earth >./expected.json
     RUN jq -S . ./expected.json >./expected.pretty.json
     SAVE ARTIFACT ./expected.pretty.json AS LOCAL ./${TEST}.ast.json
@@ -147,13 +143,5 @@ INPUT_COPY:
     IF [[ -z $INPUT_FROM_TARGET ]]
         COPY ${INPUT_FROM_DIR}${TEST}.earth ./
     ELSE
-        COPY \
-            ( \
-                ${INPUT_FROM_DIR}+${INPUT_FROM_TARGET}/${TEST}.earth \
-                --DOCKERHUB_AUTH=$DOCKERHUB_AUTH \
-                --DOCKERHUB_USER_SECRET=$DOCKERHUB_USER_SECRET \
-                --DOCKERHUB_TOKEN_SECRET=$DOCKERHUB_TOKEN_SECRET \
-                --DOCKERHUB_MIRROR=$DOCKERHUB_MIRROR \
-                --DOCKERHUB_MIRROR_INSECURE=$DOCKERHUB_MIRROR_INSECURE \
-            ) .
+        COPY --pass-args ${INPUT_FROM_DIR}+${INPUT_FROM_TARGET}/${TEST}.earth .
     END

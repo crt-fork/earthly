@@ -3,7 +3,7 @@
     {
       "command": {
         "args": [
-          "alpine:3.15"
+          "alpine:3.18"
         ],
         "name": "FROM"
       }
@@ -19,6 +19,7 @@
     {
       "command": {
         "args": [
+          "--global",
           "global_var",
           "=",
           "default"
@@ -748,7 +749,7 @@
   ],
   "version": {
     "args": [
-      "0.6"
+      "0.7"
     ]
   }
 }

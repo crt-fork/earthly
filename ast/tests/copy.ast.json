@@ -3,7 +3,7 @@
     {
       "command": {
         "args": [
-          "alpine:3.15"
+          "alpine:3.18"
         ],
         "name": "FROM"
       }
@@ -816,7 +816,7 @@
             "args": [
               "ln",
               "-s",
-              "nonexistanttarget",
+              "nonexistenttarget",
               "symlink"
             ],
             "name": "RUN"
@@ -854,7 +854,7 @@
               "symlink",
               "|",
               "grep",
-              "nonexistanttarget"
+              "nonexistenttarget"
             ],
             "name": "RUN"
           }
@@ -1175,8 +1175,7 @@
   ],
   "version": {
     "args": [
-      "--use-chmod",
-      "0.6"
+      "0.7"
     ]
   }
 }

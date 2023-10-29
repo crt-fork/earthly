@@ -1,22 +1,21 @@
 package earthfile2llb
 
 import (
+	"os"
 	"path"
 	"strconv"
 	"strings"
 
-	"github.com/earthly/earthly/domain"
 	"github.com/earthly/earthly/states/dedup"
 	"github.com/earthly/earthly/util/llbutil/pllb"
-	"github.com/earthly/earthly/util/platutil"
 	"github.com/moby/buildkit/client/llb"
 	"github.com/pkg/errors"
 )
 
-func parseMounts(mounts []string, target domain.Target, ti dedup.TargetInput, cacheContext pllb.State, platr *platutil.Resolver) ([]llb.RunOption, error) {
+func (c *Converter) parseMounts(mounts []string) ([]llb.RunOption, error) {
 	var runOpts []llb.RunOption
 	for _, mount := range mounts {
-		mountRunOpts, err := parseMount(mount, target, ti, cacheContext, platr)
+		mountRunOpts, err := c.parseMount(mount)
 		if err != nil {
 			return nil, errors.Wrap(err, "parse mount")
 		}
@@ -25,7 +24,7 @@ func parseMounts(mounts []string, target domain.Target, ti dedup.TargetInput, ca
 	return runOpts, nil
 }
 
-func parseMount(mount string, target domain.Target, ti dedup.TargetInput, cacheContext pllb.State, platr *platutil.Resolver) ([]llb.RunOption, error) {
+func (c *Converter) parseMount(mount string) ([]llb.RunOption, error) {
 	var state pllb.State
 	var mountSource string
 	var mountTarget string
@@ -33,7 +32,7 @@ func parseMount(mount string, target domain.Target, ti dedup.TargetInput, cacheC
 	var mountType string
 	var mountMode int
 	var mountOpts []llb.MountOption
-	sharingMode := llb.CacheMountShared
+	sharingMode := llb.CacheMountLocked
 	kvPairs := strings.Split(mount, ",")
 	for _, kvPair := range kvPairs {
 		kvSplit := strings.SplitN(kvPair, "=", 2)
@@ -86,14 +85,14 @@ func parseMount(mount string, target domain.Target, ti dedup.TargetInput, cacheC
 			// if err != nil {
 			// 	return nil, errors.Errorf("invalid mount arg %s", kvPair)
 			// }
-		case "mode":
+		case "mode", "chmod":
 			if len(kvSplit) != 2 {
 				return nil, errors.Errorf("invalid mount arg %s", kvPair)
 			}
 			var err error
-			mountMode, err = parseMode(kvSplit[1])
+			mountMode, err = ParseMode(kvSplit[1])
 			if err != nil {
-				return nil, errors.Errorf("failed to parse mount mode %s", kvSplit[1])
+				return nil, errors.Errorf("failed to parse mount %s %s", kvSplit[0], kvSplit[1])
 			}
 		case "sharing":
 			if len(kvSplit) != 2 {
@@ -118,10 +117,6 @@ func parseMount(mount string, target domain.Target, ti dedup.TargetInput, cacheC
 	if mountType == "" {
 		return nil, errors.Errorf("mount type not specified")
 	}
-	if mountID == "" {
-		mountID = path.Clean(mountTarget)
-	}
-
 	switch mountType {
 	case "bind-experimental":
 		if mountSource == "" {
@@ -139,16 +134,21 @@ func parseMount(mount string, target domain.Target, ti dedup.TargetInput, cacheC
 		if mountTarget == "" {
 			return nil, errors.Errorf("mount target not specified")
 		}
-		if mountMode != 0 {
-			return nil, errors.Errorf("mode is not supported for type=cache")
+		if mountMode == 0 {
+			mountMode = 0644
 		}
-		key, err := cacheKeyTargetInput(ti)
+		key, err := cacheKeyTargetInput(c.targetInputActiveOnly())
 		if err != nil {
 			return nil, err
 		}
-		cachePath := path.Join("/run/cache", key, mountID)
-		mountOpts = append(mountOpts, llb.AsPersistentCacheDir(cachePath, sharingMode))
-		state = cacheContext
+		cacheID := path.Join("/run/cache", key, path.Clean(mountTarget))
+		if c.ftrs.GlobalCache && mountID != "" {
+			cacheID = mountID
+		}
+		mountOpts = append(mountOpts, llb.AsPersistentCacheDir(cacheID, sharingMode))
+		state = c.cacheContext
+		state = state.File(pllb.Mkdir("/cache", os.FileMode(mountMode)))
+		mountOpts = append(mountOpts, llb.SourcePath("/cache"))
 		return []llb.RunOption{pllb.AddMount(mountTarget, state, mountOpts...)}, nil
 	case "tmpfs":
 		if mountTarget == "" {
@@ -157,11 +157,15 @@ func parseMount(mount string, target domain.Target, ti dedup.TargetInput, cacheC
 		if mountMode != 0 {
 			return nil, errors.Errorf("mode is not supported for type=tmpfs")
 		}
-		state = platr.Scratch()
+		state = c.platr.Scratch()
 		mountOpts = append(mountOpts, llb.Tmpfs())
 		return []llb.RunOption{pllb.AddMount(mountTarget, state, mountOpts...)}, nil
 	case "ssh-experimental":
-		sshOpts := []llb.SSHOption{llb.SSHID(mountID)}
+		sshID := mountID
+		if sshID == "" {
+			sshID = path.Clean(mountTarget)
+		}
+		sshOpts := []llb.SSHOption{llb.SSHID(sshID)}
 		if mountTarget != "" {
 			sshOpts = append(sshOpts, llb.SSHSocketTarget(mountTarget))
 		}
@@ -178,9 +182,13 @@ func parseMount(mount string, target domain.Target, ti dedup.TargetInput, cacheC
 			//       buildkit side. Then we wouldn't need to open this up to everyone.
 			mountMode = 0444
 		}
-		secretID := strings.TrimPrefix(mountID, "+secrets/")
+		secretID := mountID
+		if secretID == "" {
+			secretID = path.Clean(mountTarget)
+		}
+		secretName := strings.TrimPrefix(secretID, "+secrets/")
 		secretOpts := []llb.SecretOption{
-			llb.SecretID(secretID),
+			llb.SecretID(c.secretID(secretName)),
 			llb.SecretFileOpt(0, 0, mountMode),
 		}
 		return []llb.RunOption{llb.AddSecret(mountTarget, secretOpts...)}, nil
@@ -191,7 +199,7 @@ func parseMount(mount string, target domain.Target, ti dedup.TargetInput, cacheC
 
 var errInvalidOctal = errors.New("invalid octal")
 
-func parseMode(s string) (int, error) {
+func ParseMode(s string) (int, error) {
 	if len(s) == 0 || s[0] != '0' {
 		return 0, errInvalidOctal
 	}

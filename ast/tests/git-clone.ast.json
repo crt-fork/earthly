@@ -33,9 +33,29 @@
         {
           "command": {
             "args": [
+              "test",
+              "\"$(pwd)\"",
+              "=",
+              "\"/test\""
+            ],
+            "name": "RUN"
+          }
+        },
+        {
+          "command": {
+            "args": [
               "/test/buildkit"
             ],
             "name": "WORKDIR"
+          }
+        },
+        {
+          "command": {
+            "args": [
+              "ls",
+              ".git"
+            ],
+            "name": "RUN"
           }
         },
         {
@@ -71,7 +91,7 @@
   ],
   "version": {
     "args": [
-      "0.6"
+      "0.7"
     ]
   }
 }

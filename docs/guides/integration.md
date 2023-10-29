@@ -132,7 +132,7 @@ We start with a simple Earthfile that can build and create a docker image for ou
 
 We start from an appropriate docker image and set up a working directory. 
 ``` Dockerfile
-VERSION 0.6
+VERSION 0.7
 FROM earthly/dind:alpine
 WORKDIR /scala-example
 RUN apk add openjdk11 bash wget postgresql-client
@@ -235,7 +235,7 @@ integration-test:
 ```
 The `WITH DOCKER` has a `--compose` flag that we use to start up our docker-compose and run our integration tests in that context.
 
-We can now run our it tests both locally and in the CI pipeline, in a reproducible way:
+We can now run our tests both locally and in the CI pipeline, in a reproducible way:
 
 ``` bash
 > earthly -P +integration-test

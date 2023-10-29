@@ -26,7 +26,7 @@ This UDC can be invoked from a target via `DO`
 
 ```Earthfile
 build:
-    FROM alpine:3.15
+    FROM alpine:3.18
     WORKDIR /udc-example
     RUN echo "hello" >./foo
     DO +MY_COPY --src=./foo --dest=./bar
@@ -60,9 +60,9 @@ PRINT_VAR:
 Global imports and global args are inherited from the `base` target of the same Earthfile where the command is defined in (this may be distinct from the `base` target of the caller).
 
 ```Dockerfile
-VERSION 0.6
+VERSION 0.7
 
-ARG a_global_var=value-in-global
+ARG --global a_global_var=value-in-global
 
 build:
     # prints "value-in-global"

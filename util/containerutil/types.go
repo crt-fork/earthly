@@ -2,6 +2,7 @@ package containerutil
 
 import (
 	"net/url"
+	"time"
 
 	"github.com/pkg/errors"
 )
@@ -10,8 +11,10 @@ import (
 type ContainerInfo struct {
 	ID      string
 	Name    string
+	Created time.Time
 	Status  string
 	IPs     map[string]string
+	Ports   []string
 	Image   string
 	ImageID string
 	Labels  map[string]string
@@ -71,7 +74,7 @@ type ImageInfo struct {
 type VolumeInfo struct {
 	Name       string
 	Mountpoint string
-	Size       uint64
+	SizeBytes  uint64
 }
 
 // ImageTag contains a source and target ref, used for tagging an image. It means that the SourceRef is tagged as the value in TargetRef.
@@ -185,15 +188,15 @@ const (
 )
 
 const (
-	// TCPAddress is the address at which the daemon is available when using TCP.
-	TCPAddress = "tcp://127.0.0.1:8372"
+	// TCPAddressFmt is the address at which the daemon is available when using TCP.
+	TCPAddressFmt = "tcp://127.0.0.1:%d"
 
-	// DockerAddress is the address at which the daemon is avaliable whe using a Docker Container directly
-	DockerAddress = "docker-container://earthly-buildkitd"
+	// DockerAddressFmt is the address at which the daemon is available when using a Docker Container directly
+	DockerAddressFmt = "docker-container://%s-buildkitd"
 
-	// PodmanAddress is the address at which the daemon is avaliable whe using a Podman Container directly.
+	// PodmanAddressFmt is the address at which the daemon is available when using a Podman Container directly.
 	// Currently unused due to image export issues
-	PodmanAddress = "podman-container://earthly-buildkitd"
+	PodmanAddressFmt = "podman-container://%s-buildkitd"
 
 	// SatelliteAddress is the remote address when using a Satellite to execute your builds remotely.
 	SatelliteAddress = "tcp://satellite.earthly.dev:8372"
@@ -211,6 +214,5 @@ type FrontendURLs struct {
 	//   without a more major refactor.
 
 	BuildkitHost      *url.URL
-	DebuggerHost      *url.URL
 	LocalRegistryHost *url.URL
 }

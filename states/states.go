@@ -9,6 +9,7 @@ import (
 	"github.com/earthly/earthly/states/image"
 	"github.com/earthly/earthly/util/llbutil/pllb"
 	"github.com/earthly/earthly/util/platutil"
+	"github.com/earthly/earthly/util/waitutil"
 	"github.com/earthly/earthly/variables"
 	"github.com/google/uuid"
 )
@@ -19,7 +20,7 @@ type MultiTarget struct {
 	// Visited represents the previously visited states, grouped by target
 	// name. Duplicate targets are possible if same target is called with different
 	// build args.
-	Visited *VisitedCollection
+	Visited VisitedCollection
 	// Final is the main target to be built.
 	Final *SingleTarget
 }
@@ -62,9 +63,18 @@ type SingleTarget struct {
 
 	// doSavesMu is a mutex for doSave.
 	doSavesMu sync.Mutex
-	// doSaves indicates whether the SaveImages and the SaveLocals should be
-	// actually saved (and possibly pushed).
+	// doSaves indicates whether the SaveImages and the SaveLocals should actually be saved
 	doSaves bool
+
+	// doPushes indicates whether the SaveImages should actually be pushed
+	doPushes bool
+
+	// WaitBlocks contains the caller's waitblock plus any additional waitblocks defined in the target
+	WaitBlocks []waitutil.WaitBlock
+
+	// WaitItems contains all wait items which are created by the target
+	// it exists for tracking items in the target vs a caller's wait block that is shared between multiple targets
+	WaitItems []waitutil.WaitItem
 
 	// doneCh is a channel that is closed when the sts is complete.
 	doneCh chan struct{}
@@ -98,6 +108,11 @@ func newSingleTarget(ctx context.Context, target domain.Target, platr *platutil.
 		doneCh:                   make(chan struct{}),
 		incomingNewSubscriptions: make(chan string, 1024),
 	}
+	sts.addOverridingVarsAsBuildArgInputs(overridingVars)
+	if parentDepSub == nil {
+		// New simplified algorithm.
+		return sts, nil
+	}
 	// Consume all items from the parent subscription before returning control.
 OuterLoop:
 	for {
@@ -127,7 +142,7 @@ OuterLoop:
 }
 
 // GetDoSaves returns whether the SaveImages and the SaveLocals should be
-// actually saved (and possibly pushed).
+// actually saved.
 func (sts *SingleTarget) GetDoSaves() bool {
 	sts.doSavesMu.Lock()
 	defer sts.doSavesMu.Unlock()
@@ -139,6 +154,62 @@ func (sts *SingleTarget) SetDoSaves() {
 	sts.doSavesMu.Lock()
 	defer sts.doSavesMu.Unlock()
 	sts.doSaves = true
+	for _, wi := range sts.WaitItems {
+		wi.SetDoSave()
+	}
+	for _, wb := range sts.WaitBlocks {
+		wb.SetDoSaves()
+	}
+}
+
+// GetDoPushes returns whether the SAVE IMAGE --push or RUN --push commands
+// should be executed
+func (sts *SingleTarget) GetDoPushes() bool {
+	sts.doSavesMu.Lock()
+	defer sts.doSavesMu.Unlock()
+	return sts.doPushes
+}
+
+// SetDoPushes sets the doPushes flag.
+func (sts *SingleTarget) SetDoPushes() {
+	sts.doSavesMu.Lock()
+	defer sts.doSavesMu.Unlock()
+	sts.doPushes = true
+	for _, wi := range sts.WaitItems {
+		wi.SetDoPush()
+	}
+	for _, wb := range sts.WaitBlocks {
+		wb.SetDoPushes()
+	}
+}
+
+// AddWaitBlock adds a wait block to the state
+func (sts *SingleTarget) AddWaitBlock(waitBlock waitutil.WaitBlock) {
+	sts.doSavesMu.Lock()
+	defer sts.doSavesMu.Unlock()
+	sts.WaitBlocks = append(sts.WaitBlocks, waitBlock)
+}
+
+// Wait performs a Wait on all wait blocks
+func (sts *SingleTarget) Wait(ctx context.Context) error {
+	sts.doSavesMu.Lock()
+	defer sts.doSavesMu.Unlock()
+	for i := len(sts.WaitBlocks) - 1; i >= 0; i-- {
+		err := sts.WaitBlocks[i].Wait(ctx, sts.doPushes, sts.doSaves)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// AttachTopLevelWaitItems adds pre-created wait items to a new waitblock
+func (sts *SingleTarget) AttachTopLevelWaitItems(ctx context.Context, waitBlock waitutil.WaitBlock) {
+	sts.doSavesMu.Lock()
+	defer sts.doSavesMu.Unlock()
+	for _, item := range sts.WaitItems {
+		waitBlock.AddItem(item)
+	}
 }
 
 // TargetInput returns the target input in a concurrent-safe way.
@@ -153,17 +224,6 @@ func (sts *SingleTarget) AddBuildArgInput(bai dedup.BuildArgInput) {
 	sts.tiMu.Lock()
 	defer sts.tiMu.Unlock()
 	sts.targetInput = sts.targetInput.WithBuildArgInput(bai)
-}
-
-// AddOverridingVarsAsBuildArgInputs adds some vars to the sts's target input.
-func (sts *SingleTarget) AddOverridingVarsAsBuildArgInputs(overridingVars *variables.Scope) {
-	sts.tiMu.Lock()
-	defer sts.tiMu.Unlock()
-	for _, key := range overridingVars.SortedAny() {
-		ovVar, _ := overridingVars.GetAny(key)
-		sts.targetInput = sts.targetInput.WithBuildArgInput(
-			dedup.BuildArgInput{ConstantValue: ovVar, Name: key})
-	}
 }
 
 // LastSaveImage returns the last save image available (if any).
@@ -231,6 +291,16 @@ func (sts *SingleTarget) Done() chan struct{} {
 	return sts.doneCh
 }
 
+func (sts *SingleTarget) addOverridingVarsAsBuildArgInputs(overridingVars *variables.Scope) {
+	sts.tiMu.Lock()
+	defer sts.tiMu.Unlock()
+	for _, key := range overridingVars.Sorted() {
+		ovVar, _ := overridingVars.Get(key)
+		sts.targetInput = sts.targetInput.WithBuildArgInput(
+			dedup.BuildArgInput{ConstantValue: ovVar, Name: key})
+	}
+}
+
 // SaveLocal is an artifact path to be saved to local disk.
 type SaveLocal struct {
 	// DestPath is the local dest path to copy the artifact to.
@@ -263,6 +333,11 @@ type SaveImage struct {
 	// list (usually used for multi-platform setups). This means that the image
 	// can only be a single-platform image.
 	NoManifestList bool
+
+	Platform    platutil.Platform
+	HasPlatform bool // true when the --platform value was set (either on cli, or via FROM --platform=..., or BUILD --platform=...)
+
+	SkipBuilder bool // for use with WAIT/END
 }
 
 // RunPush is a series of RUN --push commands to be run after the build has been deemed as

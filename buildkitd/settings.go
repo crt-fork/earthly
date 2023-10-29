@@ -13,9 +13,9 @@ import (
 type Settings struct {
 	CacheSizeMb          int
 	CacheSizePct         int
+	CacheKeepDuration    int
 	Debug                bool
 	BuildkitAddress      string
-	DebuggerAddress      string
 	LocalRegistryAddress string
 	AdditionalArgs       []string
 	AdditionalConfig     string
@@ -32,8 +32,12 @@ type Settings struct {
 	IPTables             string
 	MaxParallelism       int
 	SatelliteName        string `hash:"ignore"`
-	SatelliteOrg         string `hash:"ignore"`
+	SatelliteDisplayName string `hash:"ignore"`
+	SatelliteOrgID       string `hash:"ignore"`
 	SatelliteToken       string `hash:"ignore"`
+	EnableProfiler       bool
+	NoUpdate             bool   `hash:"ignore"`
+	StartUpLockPath      string `hash:"ignore"`
 }
 
 // Hash returns a secure hash of the settings.

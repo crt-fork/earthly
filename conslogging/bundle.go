@@ -29,11 +29,12 @@ type targetLogger struct {
 
 // BundleBuilder builds log bundles for local storage or upload to a logging server
 type BundleBuilder struct {
-	entrypoint    string
+	entrypoint string
+	started    time.Time
+	cleanup    *cleanup.Collection
+
+	mu            sync.Mutex
 	logsForTarget map[string]*targetLogger
-	addTargetMu   sync.Mutex
-	started       time.Time
-	cleanup       *cleanup.Collection
 }
 
 // Write implements io.Writer as a passthrough to the underlying strings.Builder for convenience.
@@ -54,6 +55,8 @@ func NewBundleBuilder(entrypoint string, cleanup *cleanup.Collection) *BundleBui
 
 // PrefixResult sets the prefix(aka target) result as it should appear in the manifest for that specific target.
 func (bb *BundleBuilder) PrefixResult(prefix, result string) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
 	if builder, ok := bb.logsForTarget[prefix]; ok {
 		builder.result = result
 	}
@@ -61,6 +64,8 @@ func (bb *BundleBuilder) PrefixResult(prefix, result string) {
 
 // PrefixStatus sets the prefix(aka target) result as it should appear in the manifest for that specific target.
 func (bb *BundleBuilder) PrefixStatus(prefix, status string) {
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
 	if builder, ok := bb.logsForTarget[prefix]; ok {
 		builder.status = status
 	}
@@ -69,8 +74,8 @@ func (bb *BundleBuilder) PrefixStatus(prefix, status string) {
 // PrefixWriter gets an io.Writer for a given prefix(aka target). If its a prefix we have not seen before,
 // then generate a new writer to accomodate it.
 func (bb *BundleBuilder) PrefixWriter(prefix string) io.Writer {
-	bb.addTargetMu.Lock()
-	defer bb.addTargetMu.Unlock()
+	bb.mu.Lock()
+	defer bb.mu.Unlock()
 
 	if builder, ok := bb.logsForTarget[prefix]; ok {
 		return builder
@@ -106,9 +111,17 @@ func (bb *BundleBuilder) WriteToDisk() (string, error) {
 	tarWriter := tar.NewWriter(gzipWriter)
 	defer tarWriter.Close()
 
+	// Make a copy so that we keep the lock for as little time as possible.
+	bb.mu.Lock()
+	logsForTarget := make(map[string]*targetLogger, len(bb.logsForTarget))
+	for k, v := range bb.logsForTarget {
+		logsForTarget[k] = v
+	}
+	bb.mu.Unlock()
+
 	// Convert targets to manifest representations, get tar headers for data
 	targetData := make([]TargetManifest, 0)
-	for _, lines := range bb.logsForTarget {
+	for _, lines := range logsForTarget {
 		mt, err := lines.toManifestTarget()
 		if err != nil {
 			// Something was wrong with this targets logs (0 length, or blacklisted name...). Ignore it.
@@ -120,35 +133,53 @@ func (bb *BundleBuilder) WriteToDisk() (string, error) {
 		trimmed := strings.TrimSpace(lines.prefix)
 		escaped := url.QueryEscape(trimmed)
 
-		tarWriter.WriteHeader(&tar.Header{
+		err = tarWriter.WriteHeader(&tar.Header{
 			Name:       fmt.Sprintf("target/%s", escaped),
 			Size:       int64(lines.writer.Len()),
 			Mode:       0600,
 			ChangeTime: time.Now(),
 		})
-		tarWriter.Write([]byte(lines.writer.String()))
+		if err != nil {
+			return "", errors.Wrapf(err, "could not write target header")
+		}
+		_, err = tarWriter.Write([]byte(lines.writer.String()))
+		if err != nil {
+			return "", errors.Wrapf(err, "could not write target data")
+		}
 	}
 
 	// build manifest and permissions
 	mani := bb.buildManifest(targetData)
 	manifestJSON, _ := json.Marshal(mani)
-	tarWriter.WriteHeader(&tar.Header{
+	err = tarWriter.WriteHeader(&tar.Header{
 		Name:       "manifest",
 		Size:       int64(len(manifestJSON)),
 		Mode:       0600,
 		ChangeTime: time.Now(),
 	})
-	tarWriter.Write(manifestJSON)
+	if err != nil {
+		return "", errors.Wrapf(err, "could not write manifest header")
+	}
+	_, err = tarWriter.Write(manifestJSON)
+	if err != nil {
+		return "", errors.Wrapf(err, "could not write manifest")
+	}
 
 	perm := bb.buildPermissions()
 	permissionsJSON, _ := json.Marshal(perm)
-	tarWriter.WriteHeader(&tar.Header{
+	err = tarWriter.WriteHeader(&tar.Header{
 		Name:       "permissions",
 		Size:       int64(len(permissionsJSON)),
 		Mode:       0600,
 		ChangeTime: time.Now(),
 	})
-	tarWriter.Write(permissionsJSON)
+	if err != nil {
+		return "", errors.Wrapf(err, "could not write permissions header")
+	}
+	_, err = tarWriter.Write(permissionsJSON)
+	if err != nil {
+		return "", errors.Wrapf(err, "could not write permissions")
+	}
 
 	return file.Name(), nil
 }

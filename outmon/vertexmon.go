@@ -3,12 +3,17 @@ package outmon
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/armon/circbuf"
 	"github.com/earthly/earthly/conslogging"
+	"github.com/earthly/earthly/util/progressbar"
+	"github.com/earthly/earthly/util/vertexmeta"
 	"github.com/mattn/go-isatty"
 	"github.com/moby/buildkit/client"
 	"github.com/pkg/errors"
@@ -16,7 +21,7 @@ import (
 
 type vertexMonitor struct {
 	vertex         *client.Vertex
-	meta           *VertexMeta
+	meta           *vertexmeta.VertexMeta
 	operation      string
 	lastProgress   map[string]time.Time
 	lastPercentage map[string]int
@@ -31,7 +36,7 @@ type vertexMonitor struct {
 	lastOpenLineSkipped bool
 }
 
-func (vm *vertexMonitor) printHeader() {
+func (vm *vertexMonitor) printHeader(verbose bool) {
 	vm.headerPrinted = true
 	if vm.operation == "" {
 		return
@@ -43,6 +48,9 @@ func (vm *vertexMonitor) printHeader() {
 	}
 	if vm.meta.OverridingArgs != nil {
 		metaParts = append(metaParts, vm.meta.OverridingArgsString())
+	}
+	if verbose && len(vm.meta.Secrets) != 0 {
+		metaParts = append(metaParts, vm.meta.SecretsString())
 	}
 	if len(metaParts) > 0 {
 		c.WithMetadataMode(true).Printf("%s\n", strings.Join(metaParts, " | "))
@@ -170,18 +178,74 @@ func (vm *vertexMonitor) printProgress(id string, progress int, verbose bool, sa
 		// Overwrite previous line if this update is for the same thing as the previous one.
 		builder = append(builder, string(ansiUp))
 	}
-	progressBar := progressBar(progress, 10)
+	progressBar := progressbar.ProgressBar(progress, 10)
 	builder = append(builder, fmt.Sprintf("[%s] %3d%% %s%s\n", progressBar, progress, id, string(ansiEraseRestLine)))
 	vm.console.PrintBytes([]byte(strings.Join(builder, "")))
 }
 
+var reErrExitCode = regexp.MustCompile(`^process (".*") did not complete successfully: exit code: ([0-9]+)$`)
+var reErrNotFound = regexp.MustCompile(`^failed to calculate checksum of ref ([^ ]*): (.*)$`)
+
 func (vm *vertexMonitor) printError() bool {
-	if strings.Contains(vm.vertex.Error, "did not complete successfully") {
-		vm.console.Warnf("ERROR: Command exited with non-zero code: %s\n", vm.operation)
-		return true
+	isFatal := false
+	errString := vm.vertex.Error
+	indentOp := strings.Join(strings.Split(vm.operation, "\n"), "\n          ")
+	internalStr := ""
+	if vm.meta.Internal {
+		internalStr = " internal"
 	}
-	vm.console.Printf("WARN: (%s) %s\n", vm.operation, vm.vertex.Error)
-	return false
+	switch {
+	case reErrExitCode.MatchString(errString):
+		m := reErrExitCode.FindStringSubmatch(errString)
+
+		// Ignore the Error, default case will print it as a string using the source, so we won't miss any data.
+		exitCode, _ := strconv.ParseUint(m[2], 10, 32)
+
+		switch exitCode {
+		case math.MaxUint32:
+			errString = fmt.Sprintf(""+
+				"      The%s command\n"+
+				"          %s\n"+
+				"      was terminated because the build system ran out of memory.\n"+
+				"      If you are using a satellite or other remote buildkit, it is the remote system that ran out of memory.",
+				internalStr, indentOp)
+		default:
+			errString = fmt.Sprintf(""+
+				"      The%s command\n"+
+				"          %s\n"+
+				"      did not complete successfully. Exit code %s",
+				internalStr, indentOp, m[2])
+		}
+
+		isFatal = true
+	case reErrNotFound.MatchString(errString):
+		m := reErrNotFound.FindStringSubmatch(errString)
+		errString = fmt.Sprintf(""+
+			"      The%s command\n"+
+			"          %s\n"+
+			"      failed: %s",
+			internalStr, indentOp, m[2])
+		isFatal = true
+	case errString == "no active sessions":
+		errString = "Canceled"
+	default:
+		errString = fmt.Sprintf(
+			"The%s command '%s' failed: %s", internalStr, vm.operation, errString)
+	}
+	slString := ""
+	if vm.meta.SourceLocation != nil {
+		slString = fmt.Sprintf(
+			" %s line %d:%d",
+			vm.meta.SourceLocation.File, vm.meta.SourceLocation.StartLine,
+			vm.meta.SourceLocation.StartColumn)
+	}
+	if isFatal {
+		vm.console.Warnf("ERROR%s\n%s\n", slString, errString)
+	} else {
+		vm.console.Printf("WARN%s: %s\n", slString, errString)
+	}
+	vm.console.VerbosePrintf("Overriding args used: %s\n", vm.meta.OverridingArgsString())
+	return isFatal
 }
 
 func (vm *vertexMonitor) printTimingInfo() {

@@ -2,8 +2,9 @@ package secretprovider
 
 import (
 	"context"
-	"strings"
+	"net/url"
 
+	"github.com/earthly/earthly/cloud"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/secrets"
 	"github.com/pkg/errors"
@@ -25,30 +26,25 @@ func (sp *secretProvider) Register(server *grpc.Server) {
 // if the name contains a /, then we can infer that it references the shared secret service.
 func (sp *secretProvider) GetSecret(ctx context.Context, req *secrets.GetSecretRequest) (*secrets.GetSecretResponse, error) {
 
-	// shared secrets will be of the form org/path
-	// and must be transformed into /org/path
-	secretName := req.ID
-	if strings.Contains(secretName, "/") {
-		if req.ID[0] == '/' {
-			panic("secret name starts with '/'; this should never happen")
-		}
-		secretName = "/" + secretName
+	v, err := url.ParseQuery(req.ID)
+	if err != nil {
+		return nil, errors.New("failed to parse secret ID")
 	}
 
 	for _, store := range sp.stores {
-		dt, err := store.GetSecret(ctx, secretName)
+		data, err := store.GetSecret(ctx, req.ID)
 		if err != nil {
-			if errors.Is(err, secrets.ErrNotFound) {
+			if errors.Is(err, secrets.ErrNotFound) || errors.Is(err, cloud.ErrNotFound) {
 				continue
 			}
 			return nil, err
 		}
 		return &secrets.GetSecretResponse{
-			Data: dt,
+			Data: data,
 		}, nil
 	}
 
-	return nil, errors.WithStack(errors.Wrapf(secrets.ErrNotFound, "unable to lookup secret %s", secretName))
+	return nil, errors.WithStack(errors.Wrapf(secrets.ErrNotFound, "unable to lookup secret %s", v.Get("name")))
 }
 
 // New returns a new secrets provider which looks up secrets

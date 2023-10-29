@@ -3,7 +3,7 @@
     {
       "command": {
         "args": [
-          "earthly/dind:alpine"
+          "earthly/dind:alpine-3.18"
         ],
         "name": "FROM"
       }
@@ -13,6 +13,14 @@
     {
       "name": "all",
       "recipe": [
+        {
+          "command": {
+            "args": [
+              "+empty-test"
+            ],
+            "name": "BUILD"
+          }
+        },
         {
           "command": {
             "args": [
@@ -56,6 +64,22 @@
         {
           "command": {
             "args": [
+              "+docker-pull-test-long"
+            ],
+            "name": "BUILD"
+          }
+        },
+        {
+          "command": {
+            "args": [
+              "+docker-load-test-long"
+            ],
+            "name": "BUILD"
+          }
+        },
+        {
+          "command": {
+            "args": [
               "+load-parallel-test"
             ],
             "name": "BUILD"
@@ -76,6 +100,38 @@
             ],
             "name": "BUILD"
           }
+        },
+        {
+          "command": {
+            "args": [
+              "+cgroup-v2-test-all"
+            ],
+            "name": "BUILD"
+          }
+        }
+      ]
+    },
+    {
+      "name": "empty-test",
+      "recipe": [
+        {
+          "with": {
+            "body": [
+              {
+                "command": {
+                  "args": [
+                    "echo",
+                    "\"dummy\""
+                  ],
+                  "name": "RUN"
+                }
+              }
+            ],
+            "command": {
+              "args": [],
+              "name": "DOCKER"
+            }
+          }
         }
       ]
     },
@@ -85,7 +141,7 @@
         {
           "command": {
             "args": [
-              "alpine:3.15"
+              "alpine:3.18"
             ],
             "name": "FROM"
           }
@@ -164,7 +220,7 @@
         {
           "command": {
             "args": [
-              "alpine:3.15"
+              "alpine:3.18"
             ],
             "name": "FROM"
           }
@@ -222,7 +278,7 @@
         {
           "command": {
             "args": [
-              "alpine:3.15"
+              "alpine:3.18"
             ],
             "name": "FROM"
           }
@@ -278,6 +334,7 @@
               "=",
               "0"
             ],
+            "docs": "Index is used to create parallel tests.\n",
             "name": "ARG"
           }
         },
@@ -610,6 +667,12 @@
                 "command": {
                   "args": [
                     "docker",
+                    "images",
+                    "|",
+                    "grep",
+                    "hello-world",
+                    "&&",
+                    "docker",
                     "run",
                     "hello-world"
                   ],
@@ -621,6 +684,70 @@
               "args": [
                 "--pull",
                 "hello-world"
+              ],
+              "name": "DOCKER"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "docker-pull-test-long",
+      "recipe": [
+        {
+          "with": {
+            "body": [
+              {
+                "command": {
+                  "args": [
+                    "docker",
+                    "images",
+                    "|",
+                    "grep",
+                    "earthly/earthly"
+                  ],
+                  "name": "RUN"
+                }
+              }
+            ],
+            "command": {
+              "args": [
+                "--platform=linux/amd64",
+                "--pull",
+                "earthly/earthly:v0.6.17"
+              ],
+              "name": "DOCKER"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "docker-load-test-long",
+      "recipe": [
+        {
+          "with": {
+            "body": [
+              {
+                "command": {
+                  "args": [
+                    "docker",
+                    "images",
+                    "|",
+                    "grep",
+                    "foo.example.com/bar/buz",
+                    "|",
+                    "grep",
+                    "abc"
+                  ],
+                  "name": "RUN"
+                }
+              }
+            ],
+            "command": {
+              "args": [
+                "--load",
+                "foo.example.com/bar/buz:abc=+a-test-image"
               ],
               "name": "DOCKER"
             }
@@ -678,7 +805,7 @@
         {
           "command": {
             "args": [
-              "earthly/dind:alpine"
+              "earthly/dind:alpine-3.18"
             ],
             "name": "FROM"
           }
@@ -737,7 +864,7 @@
         {
           "command": {
             "args": [
-              "earthly/dind:alpine"
+              "earthly/dind:alpine-3.18"
             ],
             "name": "FROM"
           }
@@ -787,13 +914,89 @@
           }
         }
       ]
+    },
+    {
+      "name": "cgroup-v2-test-all",
+      "recipe": [
+        {
+          "command": {
+            "args": [
+              "+cgroup-v2-test",
+              "--DIND_IMG=earthly/dind:alpine-3.18-docker-23.0.6-r4",
+              "--DIND_IMG=earthly/dind:ubuntu-23.04-docker-24.0.5-1"
+            ],
+            "name": "BUILD"
+          }
+        }
+      ]
+    },
+    {
+      "name": "cgroup-v2-test",
+      "recipe": [
+        {
+          "command": {
+            "args": [
+              "--required",
+              "DIND_IMG"
+            ],
+            "name": "ARG"
+          }
+        },
+        {
+          "command": {
+            "args": [
+              "$DIND_IMG"
+            ],
+            "name": "FROM"
+          }
+        },
+        {
+          "command": {
+            "args": [
+              "test-cgroup-v2.sh",
+              "test-cgroup-v2-inside-container.sh",
+              "."
+            ],
+            "name": "COPY"
+          }
+        },
+        {
+          "command": {
+            "args": [
+              "ubuntu_img_tag",
+              "=",
+              "23.04"
+            ],
+            "name": "ARG"
+          }
+        },
+        {
+          "with": {
+            "body": [
+              {
+                "command": {
+                  "args": [
+                    "./test-cgroup-v2.sh"
+                  ],
+                  "name": "RUN"
+                }
+              }
+            ],
+            "command": {
+              "args": [
+                "--pull",
+                "ubuntu:$ubuntu_img_tag"
+              ],
+              "name": "DOCKER"
+            }
+          }
+        }
+      ]
     }
   ],
   "version": {
     "args": [
-      "--parallel-load",
-      "--shell-out-anywhere",
-      "0.6"
+      "0.7"
     ]
   }
 }

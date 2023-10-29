@@ -42,21 +42,8 @@ if [ -z "$EARTHLY_CACHE_VERSION" ]; then
 fi
 
 if [ -f "/sys/fs/cgroup/cgroup.controllers" ]; then
-    echo "detected cgroups v2"
-
-    mkdir -p /sys/fs/cgroup/earthly
-    mkdir -p /sys/fs/cgroup/buildkit
-    echo $$ > /sys/fs/cgroup/earthly/cgroup.procs
-
-    echo "+pids" > /sys/fs/cgroup/cgroup.subtree_control
-    echo "+cpu" > /sys/fs/cgroup/cgroup.subtree_control
-
-    echo "+pids" > /sys/fs/cgroup/buildkit/cgroup.subtree_control
-    echo "+cpu" > /sys/fs/cgroup/buildkit/cgroup.subtree_control
-
-    test "$(cat /sys/fs/cgroup/cgroup.type)" = "domain" || (echo "invalid root cgroup type: $(cat /sys/fs/cgroup/cgroup.type)" && exit 1)
-    test "$(cat /sys/fs/cgroup/earthly/cgroup.type)" = "domain" || (echo "invalid earthly cgroup type: $(cat /sys/fs/cgroup/earthly/cgroup.type)" && exit 1)
-    test "$(cat /sys/fs/cgroup/buildkit/cgroup.type)" = "domain" || (echo "invalid buildkit cgroup type: $(cat /sys/fs/cgroup/buildkit/cgroup.type)" && exit 1)
+    echo "detected cgroups v2; buildkit/entrypoint.sh running under pid=$$ with controllers \"$(cat /sys/fs/cgroup/cgroup.controllers)\" in group $(cat /proc/self/cgroup)"
+    test "$(cat /sys/fs/cgroup/cgroup.type)" = "domain" || (echo >&2 "WARNING: invalid root cgroup type: $(cat /sys/fs/cgroup/cgroup.type)")
 fi
 
 earthly_cache_version_path="${EARTHLY_TMP_DIR}/internal.earthly.version"
@@ -108,7 +95,7 @@ if [ -z "$IP_TABLES" ]; then
             exit 1
 
         elif [ "$legacylines" -ge "$nflines" ]; then
-            # Tiebreak goes to legacy, after testing on WSL/Windows
+            # Tie-break goes to legacy, after testing on WSL/Windows
             echo "Detected iptables-legacy by output length ($legacylines >= $nflines)"
             IP_TABLES="iptables-legacy"
 
@@ -157,6 +144,13 @@ export BUILDKIT_ROOT_DIR="$EARTHLY_TMP_DIR"/buildkit
 mkdir -p "$BUILDKIT_ROOT_DIR"
 CACHE_SETTINGS=
 
+# Length of time (in seconds) to keep cache. Zero is the same as unset to buildkit.
+CACHE_DURATION_SETTINGS=
+if [ -n "$CACHE_KEEP_DURATION" ] && [ "$CACHE_KEEP_DURATION" -gt 0 ]; then
+  CACHE_DURATION_SETTINGS="$(envsubst </etc/buildkitd.cacheduration.template)"
+fi
+export CACHE_DURATION_SETTINGS
+
 # For clarity; this will be become CACHE_SIZE_MB after everything is calculated.  It is intentionally left unset
 # (and not "0") to simplify the logic.
 EFFECTIVE_CACHE_SIZE_MB=
@@ -187,16 +181,25 @@ fi
 # set (or not), but we'll continue setting to "0" in case anyone has become dependent on that behavior.
 CACHE_SIZE_MB="${EFFECTIVE_CACHE_SIZE_MB:-0}"
 if [ "$CACHE_SIZE_MB" -gt "0" ]; then
+    SOURCE_FILE_KEEP_BYTES="$(echo "($CACHE_SIZE_MB * 1024 * 1024 * 0.5) / 1" | bc)" # Note /1 division truncates to int
+    export SOURCE_FILE_KEEP_BYTES
+    CATCH_ALL_KEEP_BYTES="$(echo "$CACHE_SIZE_MB * 1024 * 1024" | bc)"
+    export CATCH_ALL_KEEP_BYTES
     CACHE_SETTINGS="$(envsubst </etc/buildkitd.cache.template)"
 fi
 export CACHE_SETTINGS
 
-# Set up TCP feature flag
+# Set up TCP feature flag, and  also profiling (which has TCP as prerequisite)
 TCP_TRANSPORT=
+PPROF_SETTINGS=
 if [ "$BUILDKIT_TCP_TRANSPORT_ENABLED" = "true" ]; then
     TCP_TRANSPORT="$(cat /etc/buildkitd.tcp.template)"
+    if [ "$BUILDKIT_PPROF_ENABLED" = "true" ]; then
+        PPROF_SETTINGS="$(cat /etc/buildkitd.pprof.template)"
+    fi
 fi
 export TCP_TRANSPORT
+export PPROF_SETTINGS
 
 # Set up TLS feature flag
 TLS_ENABLED=
@@ -206,11 +209,45 @@ fi
 export TLS_ENABLED
 
 envsubst </etc/buildkitd.toml.template >/etc/buildkitd.toml
+
+# Session history is 1h by default unless otherwise specified
+if [ -z "$BUILDKIT_SESSION_HISTORY_DURATION" ]; then
+  BUILDKIT_SESSION_HISTORY_DURATION="1h"
+fi
+export BUILDKIT_SESSION_HISTORY_DURATION
+
+# Session timeout will automatically cancel builds that run for too long
+# Configured to 1 day by default unless otherwise specified
+if [ -z "$BUILDKIT_SESSION_TIMEOUT" ]; then
+  BUILDKIT_SESSION_TIMEOUT="24h"
+fi
+export BUILDKIT_SESSION_TIMEOUT
+
+# Set up OOM
+OOM_SCORE_ADJ="${BUILDKIT_OOM_SCORE_ADJ:-0}"
+export OOM_SCORE_ADJ
+if [ -n "$OOM_EXCLUDED_PIDS" ]; then
+  echo "The following PIDs will be ignored by the OOM reaper: $OOM_EXCLUDED_PIDS"
+fi
+
+ignored_by_oom() {
+  if echo ",$OOM_EXCLUDED_PIDS," | grep -q ",$1,"; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
+envsubst "\${OOM_SCORE_ADJ} \${BUILDKIT_DEBUG}" </bin/oom-adjust.sh.template >/bin/oom-adjust.sh
+chmod +x /bin/oom-adjust.sh
+
 echo "BUILDKIT_ROOT_DIR=$BUILDKIT_ROOT_DIR"
 echo "CACHE_SIZE_MB=$CACHE_SIZE_MB"
 echo "BUILDKIT_MAX_PARALLELISM=$BUILDKIT_MAX_PARALLELISM"
+echo "BUILDKIT_LOCAL_REGISTRY_LISTEN_PORT=$BUILDKIT_LOCAL_REGISTRY_LISTEN_PORT"
 echo "EARTHLY_ADDITIONAL_BUILDKIT_CONFIG=$EARTHLY_ADDITIONAL_BUILDKIT_CONFIG"
 echo "CNI_MTU=$CNI_MTU"
+echo "OOM_SCORE_ADJ=$OOM_SCORE_ADJ"
 echo ""
 echo "======== CNI config =========="
 cat /etc/cni/cni-conf.json
@@ -219,29 +256,55 @@ echo ""
 echo "======== Buildkitd config =========="
 cat /etc/buildkitd.toml
 echo "======== End buildkitd config =========="
-
-
+echo ""
+echo "======== OOM Adjust script =========="
+cat /bin/oom-adjust.sh
+echo "======== OOM Adjust script =========="
+echo ""
 echo "Detected container architecture is $(uname -m)"
-
-# start shell repeater server
-echo starting shellrepeater
-shellrepeater &
-shellrepeaterpid=$!
 
 "$@" &
 execpid=$!
 
-# quit if either buildkit or shellrepeater die
+stop_buildkit() {
+  echo "Shutdown signal received. Stopping buildkit..."
+  for i in $(echo "$OOM_EXCLUDED_PIDS" | sed "s/,/ /g"); do
+    echo "killing externally provided pid: $i"
+    kill -SIGTERM "$i"
+  done
+  echo "killing buildkit pid: $execpid"
+  kill -SIGTERM "$execpid"
+}
+
+trap stop_buildkit TERM QUIT INT
+
+# quit if buildkit dies
 set +x
 while true
 do
-    if ! kill -0 $shellrepeaterpid >/dev/null 2>&1; then
-        echo "Error: shellrepeater process has exited"
-        exit 1
+    if ! kill -0 "$execpid" >/dev/null 2>&1; then
+        wait "$execpid"
+        code="$?"
+        if [ "$code" != "0" ]; then
+            echo "Error: buildkit process has exited with code $code"
+        fi
+        exit "$code"
     fi
-    if ! kill -0 $execpid >/dev/null 2>&1; then
-        echo "Error: buildkit process has exited"
-        exit 1
-    fi
+
+    for PID in $(pgrep -P 1)
+    do
+        # Sometimes, child processes can be reparented to the init (this script). One
+        # common instance is when something is OOM killed, for instance. This enumerates
+        # all those PIDs, and kills them to prevent accidential "ghost" loads.
+        if [ "$PID" != "$execpid" ] && [ "$(ignored_by_oom "$PID")" = "false" ]; then
+            if [ "$OOM_SCORE_ADJ" -ne "0" ]; then
+                ! "$BUILDKIT_DEBUG" || echo "$(date) | $PID($(cat /proc/"$PID"/cmdline)) killed with OOM_SCORE_ADJ=$OOM_SCORE_ADJ" >> /var/log/oom_adj
+                kill -9 "$PID"
+            else 
+                ! "$BUILDKIT_DEBUG" || echo "$(date) | $PID($(cat /proc/"$PID"/cmdline)) was not killed because OOM_SCORE_ADJ was default or not set" >> /var/log/oom_adj
+            fi
+        fi
+    done
+
     sleep 1
 done

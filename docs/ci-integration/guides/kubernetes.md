@@ -23,7 +23,7 @@ This is the recommended approach when using Earthly within Kubernetes. Assuming 
 
 ### Dependencies
 
-Your Kubernetes cluster needs to allow `priveleged` mode pods. It's possible to use a separate instance group, along with Taints and Tolerations to effectively segregate these pods.
+Your Kubernetes cluster needs to allow `privileged` mode pods. It's possible to use a separate instance group, along with Taints and Tolerations to effectively segregate these pods.
 
 ### Installation
 
@@ -54,7 +54,7 @@ volumes:
 
 The location within the container for this temporary folder is configurable with the `EARTHLY_TMP_DIR` environment variable.
 
-The `earthly/earthly` image will expect to find the source code (with `Earthfile`) rooted in `/workspace`. To configure this, ensure that the `SRC_DIR` environment variable is set correctly. In the case of the example, we are building a remote target, so mounting a dummy volume is needed.
+The `earthly/earthly` image will expect to find the source code (with `Earthfile`) rooted in the default working directory, which is set to `/workspace`.
 
 ## Setup (Remote `earthly/buildkitd`)
 

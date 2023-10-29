@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/earthly/earthly/analytics"
@@ -13,7 +14,6 @@ import (
 	"github.com/earthly/earthly/conslogging"
 	"github.com/earthly/earthly/domain"
 	"github.com/earthly/earthly/features"
-	"github.com/earthly/earthly/outmon"
 	"github.com/earthly/earthly/util/gitutil"
 	"github.com/earthly/earthly/util/llbutil"
 	"github.com/earthly/earthly/util/llbutil/llbfactory"
@@ -21,6 +21,8 @@ import (
 	"github.com/earthly/earthly/util/platutil"
 	"github.com/earthly/earthly/util/stringutil"
 	"github.com/earthly/earthly/util/syncutil/synccache"
+	"github.com/earthly/earthly/util/vertexmeta"
+	buildkitgitutil "github.com/moby/buildkit/util/gitutil"
 
 	"github.com/moby/buildkit/client/llb"
 	gwclient "github.com/moby/buildkit/frontend/gateway/client"
@@ -32,12 +34,15 @@ const (
 )
 
 type gitResolver struct {
-	cleanCollection *cleanup.Collection
-
-	projectCache   *synccache.SyncCache // "gitURL#gitRef" -> *resolvedGitProject
-	buildFileCache *synccache.SyncCache // project ref -> local path
-	gitLookup      *GitLookup
-	console        conslogging.ConsoleLogger
+	cleanCollection   *cleanup.Collection
+	gitBranchOverride string
+	lfsInclude        string
+	logLevel          buildkitgitutil.GitLogLevel
+	gitImage          string
+	projectCache      *synccache.SyncCache // "gitURL#gitRef" -> *resolvedGitProject
+	buildFileCache    *synccache.SyncCache // project ref -> local path
+	gitLookup         *GitLookup
+	console           conslogging.ConsoleLogger
 }
 
 type resolvedGitProject struct {
@@ -49,8 +54,14 @@ type resolvedGitProject struct {
 	branches []string
 	// tags is the git tags.
 	tags []string
-	// ts is the git commit timestamp.
-	ts string
+	// committerTs is the git committer timestamp.
+	committerTs string
+	// authorTs is the git author timestamp.
+	authorTs  string
+	author    string
+	coAuthors []string
+	// refs is the git refs
+	refs []string
 	// state is the state holding the git files.
 	state pllb.State
 }
@@ -71,17 +82,20 @@ func (gr *gitResolver) resolveEarthProject(ctx context.Context, gwClient gwclien
 			// Optimization.
 			buildContextFactory = llbfactory.PreconstructedState(rgp.state)
 		} else {
-			vm := &outmon.VertexMeta{
+			vm := &vertexmeta.VertexMeta{
 				TargetName: ref.String(),
 				Internal:   true,
 			}
-			buildContextFactory = llbfactory.PreconstructedState(llbutil.CopyOp(
+			copyState, err := llbutil.CopyOp(ctx,
 				rgp.state, []string{subDir}, platr.Scratch(), "./", false, false, false, "root:root", nil, false, false, false,
-				llb.WithCustomNamef("%sCOPY git context %s", vm.ToVertexPrefix(), ref.String())))
+				llb.WithCustomNamef("%sCOPY git context %s", vm.ToVertexPrefix(), ref.String()))
+			if err != nil {
+				return nil, errors.Wrap(err, "copyOp failed in resolveEarthProject")
+			}
+			buildContextFactory = llbfactory.PreconstructedState(copyState)
 		}
-	} else {
-		// Commands don't come with a build context.
 	}
+	// Else not needed: Commands don't come with a build context.
 
 	key := ref.ProjectCanonical()
 	isDockerfile := strings.HasPrefix(ref.GetName(), DockerfileMetaTarget)
@@ -142,14 +156,19 @@ func (gr *gitResolver) resolveEarthProject(ctx context.Context, gwClient gwclien
 		BuildFilePath:       localBuildFile.path,
 		BuildContextFactory: buildContextFactory,
 		GitMetadata: &gitutil.GitMetadata{
-			BaseDir:   "",
-			RelDir:    subDir,
-			RemoteURL: gitURL,
-			Hash:      rgp.hash,
-			ShortHash: rgp.shortHash,
-			Branch:    rgp.branches,
-			Tags:      rgp.tags,
-			Timestamp: rgp.ts,
+			BaseDir:              "",
+			RelDir:               subDir,
+			RemoteURL:            gitURL,
+			Hash:                 rgp.hash,
+			ShortHash:            rgp.shortHash,
+			BranchOverrideTagArg: gr.gitBranchOverride != "",
+			Branch:               rgp.branches,
+			Tags:                 rgp.tags,
+			CommitterTimestamp:   rgp.committerTs,
+			AuthorTimestamp:      rgp.authorTs,
+			Author:               rgp.author,
+			CoAuthors:            rgp.coAuthors,
+			Refs:                 rgp.refs,
 		},
 		Features: localBuildFile.ftrs,
 	}, nil
@@ -164,27 +183,38 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 	if err != nil {
 		return nil, "", "", errors.Wrap(err, "failed to get url for cloning")
 	}
-	analytics.Count("gitResolver.resolveEarthProject", analytics.RepoHashFromCloneURL(gitURL))
+	analytics.Count("gitResolver.resolveEarthProject", "")
 
 	// Check the cache first.
-	cacheKey := fmt.Sprintf("%s#%s", gitURL, gitRef)
+	scrubbedGITURL := stringutil.ScrubCredentials(gitURL)
+	cacheKey := fmt.Sprintf("%s#%s", scrubbedGITURL, gitRef)
 	rgpValue, err := gr.projectCache.Do(ctx, cacheKey, func(ctx context.Context, k interface{}) (interface{}, error) {
 		// Copy all Earthfile, build.earth and Dockerfile files.
-		vm := &outmon.VertexMeta{
+		vm := &vertexmeta.VertexMeta{
 			TargetName: cacheKey,
 			Internal:   true,
 		}
 		gitOpts := []llb.GitOption{
-			llb.WithCustomNamef("%sGIT CLONE %s", vm.ToVertexPrefix(), stringutil.ScrubCredentials(gitURL)),
+			llb.WithCustomNamef("%sGIT CLONE %s", vm.ToVertexPrefix(), scrubbedGITURL),
 			llb.KeepGitDir(),
+			llb.LogLevel(gr.logLevel),
 		}
 		if len(keyScans) > 0 {
 			gitOpts = append(gitOpts, llb.KnownSSHHosts(strings.Join(keyScans, "\n")))
 		}
+		if gr.lfsInclude != "" {
+			// TODO this should eventually be infered by the contents of a COPY command, which means the call to resolveGitProject will need to be lazy-evaluated
+			// However this makes it really difficult for an Earthfile which first has an ARG EARTHLY_GIT_HASH, then a RUN, then a COPY
+			gitOpts = append(gitOpts, llb.LFSInclude(gr.lfsInclude))
+		}
 
 		gitState := llb.Git(gitURL, gitRef, gitOpts...)
+		gitImage := gr.gitImage
+		if gitImage == "" {
+			gitImage = defaultGitImage
+		}
 		opImg := pllb.Image(
-			defaultGitImage, llb.MarkImageInternal, llb.ResolveModePreferLocal,
+			gitImage, llb.MarkImageInternal, llb.ResolveModePreferLocal,
 			llb.Platform(platr.LLBNative()))
 
 		// Get git hash.
@@ -194,8 +224,14 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 				"git rev-parse HEAD >/dest/git-hash ; " +
 					"git rev-parse --short=8 HEAD >/dest/git-short-hash ; " +
 					"git rev-parse --abbrev-ref HEAD >/dest/git-branch  || touch /dest/git-branch ; " +
+					"ls .git/refs/heads/ | head -n 1 >/dest/git-default-branch  || touch /dest/git-default-branch ; " +
 					"git describe --exact-match --tags >/dest/git-tags || touch /dest/git-tags ; " +
-					"git log -1 --format=%ct >/dest/git-ts || touch /dest/git-ts",
+					"git log -1 --format=%ct >/dest/git-committer-ts || touch /dest/git-committer-ts ; " +
+					"git log -1 --format=%at >/dest/git-author-ts || touch /dest/git-author-ts ; " +
+					"git log -1 --format=%ae >/dest/git-author || touch /dest/git-author ; " +
+					"git log -1 --format=%b >/dest/git-body || touch /dest/git-body ; " +
+					"git for-each-ref --contains HEAD --format '%(refname:lstrip=-1)' >/dest/git-refs || touch /dest/git-refs ; " +
+					"",
 			}),
 			llb.Dir("/git-src"),
 			llb.ReadonlyRootFS(),
@@ -224,11 +260,15 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 		if err != nil {
 			return nil, errors.Wrap(err, "read git-short-hash")
 		}
-		gitBranchBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
-			Filename: "git-branch",
-		})
+		gitBranch, err := gr.readGitBranch(ctx, gitMetaRef)
 		if err != nil {
 			return nil, errors.Wrap(err, "read git-branch")
+		}
+		gitDefaultBranchBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: "git-default-branch",
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "read git-default-branch")
 		}
 		gitTagsBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
 			Filename: "git-tags",
@@ -236,21 +276,59 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 		if err != nil {
 			return nil, errors.Wrap(err, "read git-tags")
 		}
-		gitTsBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
-			Filename: "git-ts",
+		gitCommitterTsBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: "git-committer-ts",
 		})
 		if err != nil {
-			return nil, errors.Wrap(err, "read git-ts")
+			return nil, errors.Wrap(err, "read git-committer-ts")
+		}
+		gitAuthorTsBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: "git-author-ts",
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "read git-author-ts")
+		}
+		gitAuthorBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: "git-author",
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "read git-author")
+		}
+		gitBodyBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: "git-body",
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "read git-body")
+		}
+		gitRefsBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
+			Filename: "git-refs",
+		})
+		if err != nil {
+			return nil, errors.Wrap(err, "read git-refs")
 		}
 
 		gitHash := strings.SplitN(string(gitHashBytes), "\n", 2)[0]
 		gitShortHash := strings.SplitN(string(gitShortHashBytes), "\n", 2)[0]
-		gitBranches := strings.SplitN(string(gitBranchBytes), "\n", 2)
+		gitBranches := strings.SplitN(gitBranch, "\n", 2)
+		gitAuthor := strings.SplitN(string(gitAuthorBytes), "\n", 2)[0]
+		gitCoAuthors := gitutil.ParseCoAuthorsFromBody(string(gitBodyBytes))
 		var gitBranches2 []string
 		for _, gitBranch := range gitBranches {
-			if gitBranch != "" {
+			if gitBranch != "" && gitBranch != "HEAD" {
 				gitBranches2 = append(gitBranches2, gitBranch)
 			}
+		}
+		if len(gitBranches2) == 0 {
+			// fallback case for when git rev-parse --abbrev-ref fails
+			if gitRef != "" {
+				// use the reference name (if given); but only if it is not the git sha
+				if !strings.HasPrefix(gitRef, gitShortHash) {
+					gitBranches2 = []string{gitRef}
+				}
+			} else {
+				gitBranches2 = []string{strings.SplitN(string(gitDefaultBranchBytes), "\n", 2)[0]}
+			}
+
 		}
 		gitTags := strings.SplitN(string(gitTagsBytes), "\n", 2)
 		var gitTags2 []string
@@ -259,22 +337,38 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 				gitTags2 = append(gitTags2, gitTag)
 			}
 		}
-		gitTs := strings.SplitN(string(gitTsBytes), "\n", 2)[0]
+		gitCommiterTs := strings.SplitN(string(gitCommitterTsBytes), "\n", 2)[0]
+		gitAuthorTs := strings.SplitN(string(gitAuthorTsBytes), "\n", 2)[0]
+		gitRefs := strings.Split(string(gitRefsBytes), "\n")
+		var gitRefs2 []string
+		for _, gitRef := range gitRefs {
+			gitRef = strings.Trim(gitRef, "'\"")
+			if gitRef != "" && gitRef != "HEAD" && !slices.Contains(gitRefs2, gitRef) {
+				gitRefs2 = append(gitRefs2, gitRef)
+			}
+		}
 
 		gitOpts = []llb.GitOption{
-			llb.WithCustomNamef("[context %s] git context %s", stringutil.ScrubCredentials(gitURL), ref.StringCanonical()),
+			llb.WithCustomNamef("[context %s] git context %s", scrubbedGITURL, ref.StringCanonical()),
 			llb.KeepGitDir(),
 		}
 		if len(keyScans) > 0 {
 			gitOpts = append(gitOpts, llb.KnownSSHHosts(strings.Join(keyScans, "\n")))
 		}
+		if gr.lfsInclude != "" {
+			gitOpts = append(gitOpts, llb.LFSInclude(gr.lfsInclude))
+		}
 
 		rgp := &resolvedGitProject{
-			hash:      gitHash,
-			shortHash: gitShortHash,
-			branches:  gitBranches2,
-			tags:      gitTags2,
-			ts:        gitTs,
+			hash:        gitHash,
+			shortHash:   gitShortHash,
+			branches:    gitBranches2,
+			tags:        gitTags2,
+			committerTs: gitCommiterTs,
+			authorTs:    gitAuthorTs,
+			author:      gitAuthor,
+			coAuthors:   gitCoAuthors,
+			refs:        gitRefs2,
 			state: pllb.Git(
 				gitURL,
 				gitHash,
@@ -284,11 +378,11 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 		go func() {
 			// Add cache entries for the branch and for the tag (if any).
 			if len(gitBranches2) > 0 {
-				cacheKey3 := fmt.Sprintf("%s#%s", gitURL, gitBranches2[0])
+				cacheKey3 := fmt.Sprintf("%s#%s", scrubbedGITURL, gitBranches2[0])
 				_ = gr.projectCache.Add(ctx, cacheKey3, rgp, nil)
 			}
 			if len(gitTags2) > 0 {
-				cacheKey4 := fmt.Sprintf("%s#%s", gitURL, gitTags2[0])
+				cacheKey4 := fmt.Sprintf("%s#%s", scrubbedGITURL, gitTags2[0])
 				_ = gr.projectCache.Add(ctx, cacheKey4, rgp, nil)
 			}
 		}()
@@ -299,4 +393,17 @@ func (gr *gitResolver) resolveGitProject(ctx context.Context, gwClient gwclient.
 	}
 	rgp = rgpValue.(*resolvedGitProject)
 	return rgp, gitURL, subDir, nil
+}
+
+func (gr *gitResolver) readGitBranch(ctx context.Context, gitMetaRef gwclient.Reference) (string, error) {
+	if gr.gitBranchOverride != "" {
+		return gr.gitBranchOverride, nil
+	}
+	gitBranchBytes, err := gitMetaRef.ReadFile(ctx, gwclient.ReadRequest{
+		Filename: "git-branch",
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(gitBranchBytes), nil
 }

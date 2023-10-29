@@ -12,7 +12,7 @@ We also have instructions for [specific CI systems](#examples); and special-case
 
 ## Dependencies
 
-Earthly has two software dependencies: `docker` and `git`. Because `earthly` will not install these for you, please ensure they are present before proceeding. These tools are very common, so many environments will already have them installed. If you choose to use our prebuilt containers, these dep 
+Earthly has two software dependencies: `docker` and `git`. Because `earthly` will not install these for you, please ensure they are present before proceeding. These tools are very common, so many environments will already have them installed. If you choose to use our prebuilt containers, these dependencies are already included.
 
 `docker` is used to glean information about the containerization environment, and manage our `earthly-buildkitd` daemon. It is also used to do things like save images locally on your machine after they have been built by Earthly. To install `docker`, use the most recent versions [directly from Docker](https://docs.docker.com/engine/install/#server). The versions packaged for many distributions tend to fall behind.
 
@@ -27,7 +27,7 @@ Once you have ensured that the dependencies are available, you'll need to instal
 This is the simplest method for adding `earthly` to your CI. It will work best on dedicated computers, or in scripted/auto-provisioned build environments. You can pin it to a specific version like so:
 
 ```shell
-wget https://github.com/earthly/earthly/releases/download/v0.6.14/earthly-linux-amd64 -O /usr/local/bin/earthly && \
+wget https://github.com/earthly/earthly/releases/download/v0.7.21/earthly-linux-amd64 -O /usr/local/bin/earthly && \
 chmod +x /usr/local/bin/earthly && \
 /usr/local/bin/earthly bootstrap
 ```
@@ -79,9 +79,9 @@ Earthly also has some special command-line switches to ensure best practices are
 
 Earthly also has a special [`--push`](../earthfile/earthfile.md#push) option that can be used when invoking a target. In a CI, you may want to ensure this flag is present to push images or run commands that are not typically done as part of a normal development workflow.
 
-If you would like to do cross-platform builds, you will need to install some [`binfmt_misc`](https://github.com/multiarch/qemu-user-static) entries. This can be done by running: `docker run --rm --privileged multiarch/qemu-user-static --reset -p yes`. This installs the needed entries and `qemue-user-static` binaries on your system. This will need to be repeated on each physical box (only once, since its a kernel level change, and the kernel is shared across containers).
+If you would like to do cross-platform builds, you will need to install some [`binfmt_misc`](https://github.com/multiarch/qemu-user-static) entries. This can be done by running: `docker run --rm --privileged multiarch/qemu-user-static --reset -p yes`. This installs the needed entries and `qemu-user-static` binaries on your system. This will need to be repeated on each physical box (only once, since its a kernel level change, and the kernel is shared across containers).
 
-To share secrets with `earthly`, use the [`--secret`](../earthfile/earthfile.md#secret-less-than-env-var-greater-than-less-than-secret-ref-greater-than) option to inject secrets into your builds. You could also use our [cloud secrets](../guides/cloud-secrets.md), for a more seamless experience.
+To share secrets with `earthly`, use the [`--secret`](../earthfile/earthfile.md#secret-less-than-env-var-greater-than-less-than-secret-ref-greater-than) option to inject secrets into your builds. You could also use our [cloud secrets](../cloud/cloud-secrets.md), for a more seamless experience.
 
 ### Networking & Security
 
@@ -104,3 +104,4 @@ Below are links to CI systems that we have more specific information for. If you
  * [GitHub Actions](guides/gh-actions-integration.md)
  * [Google Cloud Build](guides/google-cloud-build.md)
  * [GitLab CI/CD](guides/gitlab-integration.md)
+ * [Woodpecker CI](guides/woodpecker-integration.md)

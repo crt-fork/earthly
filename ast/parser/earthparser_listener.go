@@ -1,8 +1,8 @@
-// Code generated from ast/parser/EarthParser.g4 by ANTLR 4.9.1. DO NOT EDIT.
+// Code generated from ast/parser/EarthParser.g4 by ANTLR 4.12.0. DO NOT EDIT.
 
 package parser // EarthParser
 
-import "github.com/antlr/antlr4/runtime/Go/antlr"
+import "github.com/antlr/antlr4/runtime/Go/antlr/v4"
 
 // EarthParserListener is a complete listener for a parse tree produced by EarthParser.
 type EarthParserListener interface {
@@ -83,6 +83,27 @@ type EarthParserListener interface {
 	// EnterElseIfExpr is called when entering the elseIfExpr production.
 	EnterElseIfExpr(c *ElseIfExprContext)
 
+	// EnterTryStmt is called when entering the tryStmt production.
+	EnterTryStmt(c *TryStmtContext)
+
+	// EnterTryClause is called when entering the tryClause production.
+	EnterTryClause(c *TryClauseContext)
+
+	// EnterTryBlock is called when entering the tryBlock production.
+	EnterTryBlock(c *TryBlockContext)
+
+	// EnterCatchClause is called when entering the catchClause production.
+	EnterCatchClause(c *CatchClauseContext)
+
+	// EnterCatchBlock is called when entering the catchBlock production.
+	EnterCatchBlock(c *CatchBlockContext)
+
+	// EnterFinallyClause is called when entering the finallyClause production.
+	EnterFinallyClause(c *FinallyClauseContext)
+
+	// EnterFinallyBlock is called when entering the finallyBlock production.
+	EnterFinallyBlock(c *FinallyBlockContext)
+
 	// EnterForStmt is called when entering the forStmt production.
 	EnterForStmt(c *ForStmtContext)
 
@@ -94,6 +115,18 @@ type EarthParserListener interface {
 
 	// EnterForExpr is called when entering the forExpr production.
 	EnterForExpr(c *ForExprContext)
+
+	// EnterWaitStmt is called when entering the waitStmt production.
+	EnterWaitStmt(c *WaitStmtContext)
+
+	// EnterWaitClause is called when entering the waitClause production.
+	EnterWaitClause(c *WaitClauseContext)
+
+	// EnterWaitBlock is called when entering the waitBlock production.
+	EnterWaitBlock(c *WaitBlockContext)
+
+	// EnterWaitExpr is called when entering the waitExpr production.
+	EnterWaitExpr(c *WaitExprContext)
 
 	// EnterFromStmt is called when entering the fromStmt production.
 	EnterFromStmt(c *FromStmtContext)
@@ -146,6 +179,12 @@ type EarthParserListener interface {
 	// EnterArgStmt is called when entering the argStmt production.
 	EnterArgStmt(c *ArgStmtContext)
 
+	// EnterSetStmt is called when entering the setStmt production.
+	EnterSetStmt(c *SetStmtContext)
+
+	// EnterLetStmt is called when entering the letStmt production.
+	EnterLetStmt(c *LetStmtContext)
+
 	// EnterOptionalFlag is called when entering the optionalFlag production.
 	EnterOptionalFlag(c *OptionalFlagContext)
 
@@ -196,6 +235,15 @@ type EarthParserListener interface {
 
 	// EnterHostStmt is called when entering the hostStmt production.
 	EnterHostStmt(c *HostStmtContext)
+
+	// EnterProjectStmt is called when entering the projectStmt production.
+	EnterProjectStmt(c *ProjectStmtContext)
+
+	// EnterPipelineStmt is called when entering the pipelineStmt production.
+	EnterPipelineStmt(c *PipelineStmtContext)
+
+	// EnterTriggerStmt is called when entering the triggerStmt production.
+	EnterTriggerStmt(c *TriggerStmtContext)
 
 	// EnterExpr is called when entering the expr production.
 	EnterExpr(c *ExprContext)
@@ -284,6 +332,27 @@ type EarthParserListener interface {
 	// ExitElseIfExpr is called when exiting the elseIfExpr production.
 	ExitElseIfExpr(c *ElseIfExprContext)
 
+	// ExitTryStmt is called when exiting the tryStmt production.
+	ExitTryStmt(c *TryStmtContext)
+
+	// ExitTryClause is called when exiting the tryClause production.
+	ExitTryClause(c *TryClauseContext)
+
+	// ExitTryBlock is called when exiting the tryBlock production.
+	ExitTryBlock(c *TryBlockContext)
+
+	// ExitCatchClause is called when exiting the catchClause production.
+	ExitCatchClause(c *CatchClauseContext)
+
+	// ExitCatchBlock is called when exiting the catchBlock production.
+	ExitCatchBlock(c *CatchBlockContext)
+
+	// ExitFinallyClause is called when exiting the finallyClause production.
+	ExitFinallyClause(c *FinallyClauseContext)
+
+	// ExitFinallyBlock is called when exiting the finallyBlock production.
+	ExitFinallyBlock(c *FinallyBlockContext)
+
 	// ExitForStmt is called when exiting the forStmt production.
 	ExitForStmt(c *ForStmtContext)
 
@@ -295,6 +364,18 @@ type EarthParserListener interface {
 
 	// ExitForExpr is called when exiting the forExpr production.
 	ExitForExpr(c *ForExprContext)
+
+	// ExitWaitStmt is called when exiting the waitStmt production.
+	ExitWaitStmt(c *WaitStmtContext)
+
+	// ExitWaitClause is called when exiting the waitClause production.
+	ExitWaitClause(c *WaitClauseContext)
+
+	// ExitWaitBlock is called when exiting the waitBlock production.
+	ExitWaitBlock(c *WaitBlockContext)
+
+	// ExitWaitExpr is called when exiting the waitExpr production.
+	ExitWaitExpr(c *WaitExprContext)
 
 	// ExitFromStmt is called when exiting the fromStmt production.
 	ExitFromStmt(c *FromStmtContext)
@@ -347,6 +428,12 @@ type EarthParserListener interface {
 	// ExitArgStmt is called when exiting the argStmt production.
 	ExitArgStmt(c *ArgStmtContext)
 
+	// ExitSetStmt is called when exiting the setStmt production.
+	ExitSetStmt(c *SetStmtContext)
+
+	// ExitLetStmt is called when exiting the letStmt production.
+	ExitLetStmt(c *LetStmtContext)
+
 	// ExitOptionalFlag is called when exiting the optionalFlag production.
 	ExitOptionalFlag(c *OptionalFlagContext)
 
@@ -397,6 +484,15 @@ type EarthParserListener interface {
 
 	// ExitHostStmt is called when exiting the hostStmt production.
 	ExitHostStmt(c *HostStmtContext)
+
+	// ExitProjectStmt is called when exiting the projectStmt production.
+	ExitProjectStmt(c *ProjectStmtContext)
+
+	// ExitPipelineStmt is called when exiting the pipelineStmt production.
+	ExitPipelineStmt(c *PipelineStmtContext)
+
+	// ExitTriggerStmt is called when exiting the triggerStmt production.
+	ExitTriggerStmt(c *TriggerStmtContext)
 
 	// ExitExpr is called when exiting the expr production.
 	ExitExpr(c *ExprContext)
